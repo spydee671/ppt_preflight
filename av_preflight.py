@@ -27,6 +27,7 @@ try:
     from pptx import Presentation
     from pptx.util import Emu
     from pptx.oxml.ns import qn
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
 except ImportError:
     print("python-pptx not installed. Run: pip install python-pptx")
     sys.exit(1)
@@ -178,6 +179,83 @@ def slide_images(slide, slide_num, zf):
             size=_embedded_size(rel, zf) if embedded else None,
         ))
     return items
+
+
+# ── Image resolution check ───────────────────────────────────────────────────
+
+# PPI thresholds for screen display
+_PPI_LOW    = 96   # below this may look blurry on a standard monitor
+_PPI_HIGH   = 300  # above this is print resolution — no visible benefit on screen
+_PPI_TARGET = 192  # used to suggest ideal pixel dimensions (good for HiDPI/Retina)
+
+R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+
+def image_ppi_issues(prs):
+    """
+    Inspect every picture shape for under- or over-resolution.
+    Returns (issues, n_checked) where issues is None if Pillow is not installed.
+    """
+    try:
+        import io
+        from PIL import Image as PILImage
+    except ImportError:
+        return None, 0
+
+    issues  = []
+    checked = 0
+
+    for slide_num, slide in enumerate(prs.slides, 1):
+        for shape in slide.shapes:
+            if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+                continue
+            try:
+                blob   = shape.image.blob
+                img    = PILImage.open(io.BytesIO(blob))
+                img_w, img_h = img.size
+                checked += 1
+
+                if shape.width == 0 or shape.height == 0:
+                    continue
+
+                shape_w_in = shape.width  / EMU_PER_INCH
+                shape_h_in = shape.height / EMU_PER_INCH
+                ppi = ((img_w / shape_w_in) + (img_h / shape_h_in)) / 2
+
+                if _PPI_LOW <= ppi <= _PPI_HIGH:
+                    continue  # fine — skip
+
+                # Resolve filename from the blip relationship
+                try:
+                    blip = shape._element.find('.//' + qn('a:blip'))
+                    rId  = blip.get(f'{{{R_NS}}}embed')
+                    name = Path(str(shape.part.rels[rId].target_part.partname)).name
+                except Exception:
+                    name = f'<shape {shape.shape_id}>'
+
+                ideal_w = round(shape_w_in * _PPI_TARGET)
+                ideal_h = round(shape_h_in * _PPI_TARGET)
+
+                issues.append(dict(
+                    slide      = slide_num,
+                    name       = name,
+                    img_w      = img_w,
+                    img_h      = img_h,
+                    w_in       = round(shape_w_in, 2),
+                    h_in       = round(shape_h_in, 2),
+                    ppi        = round(ppi),
+                    file_size  = len(blob),
+                    too_low    = ppi < _PPI_LOW,
+                    too_high   = ppi > _PPI_HIGH,
+                    ideal_w    = ideal_w,
+                    ideal_h    = ideal_h,
+                    # How many times bigger (linear) than the HiDPI target
+                    oversize_x = round(ppi / _PPI_TARGET, 1) if ppi > _PPI_HIGH else None,
+                ))
+            except Exception:
+                continue
+
+    return issues, checked
 
 
 # ── Transitions & animations ──────────────────────────────────────────────────
@@ -386,6 +464,36 @@ def analyze(path, display_wh=(1920, 1080)):
         for img in linked_imgs:
             print(f"     slides {img['slides']}  {img['name']}")
 
+    # ── Image resolution ───────────────────────────────────────────────────────
+    ppi_issues, ppi_checked = image_ppi_issues(prs)
+
+    section_header(f"IMAGE RESOLUTION  (target {_PPI_TARGET} PPI, range {_PPI_LOW}–{_PPI_HIGH} PPI)")
+    if ppi_issues is None:
+        print("  (install Pillow to enable: pip install Pillow)")
+    elif ppi_checked == 0:
+        print("  (no picture shapes found)")
+    elif not ppi_issues:
+        print(f"  ✓  {ppi_checked} image(s) checked — all within range")
+    else:
+        ok_count = ppi_checked - len(ppi_issues)
+        for issue in ppi_issues:
+            dim_str  = f"{issue['img_w']}×{issue['img_h']} px"
+            size_str = f"{issue['w_in']}\"×{issue['h_in']}\""
+            if issue['too_high']:
+                # Show pixel-count ratio (area) so the waste is viscerally clear
+                pixel_ratio = round((issue['img_w'] * issue['img_h']) /
+                                    (issue['ideal_w'] * issue['ideal_h']))
+                flag = (f"⚠ {issue['oversize_x']}× oversized "
+                        f"(~{pixel_ratio}× more pixels than needed — "
+                        f"reduce to ~{issue['ideal_w']}×{issue['ideal_h']} px, "
+                        f"save ~{fmt_size(issue['file_size'] - issue['file_size'] // pixel_ratio)})")
+            else:
+                flag = f"⚠ may appear blurry  (min {_PPI_LOW} PPI for standard displays)"
+            print(f"  slide {issue['slide']:>2}  {issue['name']:<26}  "
+                  f"{dim_str:<16}  {size_str:<12}  {issue['ppi']:>4} PPI  {flag}")
+        print(f"\n  {ppi_checked} image(s) checked — "
+              f"{len(ppi_issues)} issue(s), {ok_count} ok")
+
     # ── Transitions & animations ───────────────────────────────────────────────
     transitions  = []
     anim_slides  = []
@@ -506,6 +614,21 @@ def analyze(path, display_wh=(1920, 1080)):
     if ext_links:
         warnings.append(
             f"{len(ext_links)} external hyperlink(s) — confirm internet access on event system"
+        )
+
+    oversized_imgs = [i for i in (ppi_issues or []) if i['too_high']]
+    blurry_imgs    = [i for i in (ppi_issues or []) if i['too_low']]
+    if oversized_imgs:
+        worst = max(oversized_imgs, key=lambda i: i['oversize_x'] or 0)
+        warnings.append(
+            f"{len(oversized_imgs)} oversized image(s) — largest is {worst['oversize_x']}× "
+            f"the needed resolution ({worst['name']}, slide {worst['slide']}) — "
+            f"downsample to reduce file size"
+        )
+    if blurry_imgs:
+        warnings.append(
+            f"{len(blurry_imgs)} low-resolution image(s) on "
+            f"slides {[i['slide'] for i in blurry_imgs]} — may appear blurry on screen"
         )
 
     if not ratio_ok:

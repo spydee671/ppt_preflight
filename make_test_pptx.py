@@ -165,9 +165,13 @@ def slide2_image(prs):
     body.text_frame.paragraphs[0].runs[0].font.name = 'Gill Sans MT'
     body.text_frame.paragraphs[0].runs[0].font.size = Pt(18)
 
-    # Embedded PNG
-    png_bytes = make_png(rgb=(70, 130, 180))
+    # Small PNG — intentionally tiny (80×60 px at 3"×2.25") to trigger blurry warning (~27 PPI)
+    png_bytes = make_png(80, 60, rgb=(70, 130, 180))
     slide.shapes.add_picture(io.BytesIO(png_bytes), Inches(5.5), Inches(2), Inches(3), Inches(2.25))
+
+    # Large PNG — 1200×900 px displayed at 1.5"×1.125" = 800 PPI, triggers oversized warning
+    large_png = make_png(1200, 900, rgb=(200, 80, 60))
+    slide.shapes.add_picture(io.BytesIO(large_png), Inches(5.5), Inches(4.2), Inches(1.5), Inches(1.125))
 
     add_transition(slide, kind='fade', dur_ms=700)
 
@@ -284,7 +288,7 @@ def build():
     print(f"  5 slides")
     print(f"  Fonts:       Georgia, Calibri, Arial, Gill Sans MT, Trebuchet MS, Impact, Helvetica Neue, Courier New")
     print(f"  Media:       1 linked video, 1 linked audio")
-    print(f"  Images:      1 embedded PNG")
+    print(f"  Images:      2 embedded PNGs (1 blurry ~27 PPI, 1 oversized ~800 PPI)")
     print(f"  Transitions: fade (slide 2), push+auto (slide 3), dissolve (slide 4)")
     print(f"  Animations:  1 animEffect on slide 4")
     print(f"  Hyperlinks:  1 external (slide 4)")

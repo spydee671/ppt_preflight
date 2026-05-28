@@ -28,6 +28,7 @@ The `--display` flag sets the target display resolution for the aspect ratio che
 | **Video** | Each video file — embedded vs. linked, format/extension, file size; codec warning for less-common formats |
 | **Audio** | Same as video |
 | **Images** | Format breakdown and total embedded image size; linked images flagged |
+| **Image resolution** | Per-image PPI check (requires Pillow): flags images below 96 PPI (blurry on screen) and above 300 PPI (wasteful — print quality, no benefit on screen); oversized images show the pixel-count ratio and an estimated ideal size to resize to |
 | **Transitions** | Per-slide transition type; advance mode (click vs. auto-timer); auto-advance slides highlighted |
 | **Animations** | Animation effect count per animated slide |
 | **Speaker notes** | Count of slides that have notes |
@@ -125,8 +126,8 @@ Determine whether a video is set to play automatically on slide entry or only on
 ### Video loop / mute settings
 Read per-video playback flags (loop, mute, rewind after playing) from the `p14:media` extension element on the video shape's `nvPr`. Useful for checking background loop videos common in conference staging.
 
-### Image resolution check
-Use [Pillow](https://pillow.readthedocs.io) to read each embedded image's pixel dimensions, then divide by the shape's physical size in inches to compute effective PPI. Flag anything below ~96 PPI as potentially blurry on a large screen. Requires `pip install Pillow`.
+### ~~Image resolution check~~ ✓ done
+Implemented — requires `pip install Pillow`. Flags images below 96 PPI (blurry) and above 300 PPI (oversized), with pixel-count ratio and suggested resize dimensions for oversized images.
 
 ### Video codec / container report
 Pipe embedded video files through `ffprobe` (part of [ffmpeg](https://ffmpeg.org)) to report codec, resolution, frame rate, and bitrate. Useful for confirming H.264/AAC in an MP4 container — the most broadly supported format on event playback systems.
@@ -144,6 +145,7 @@ Render all slides to a contact-sheet image using LibreOffice + `pdftoppm` for a 
 
 - Python 3.8+
 - [python-pptx](https://python-pptx.readthedocs.io) 0.6+
+- [Pillow](https://pillow.readthedocs.io) *(optional — required for image resolution checks)*
 
 ## Licence
 
