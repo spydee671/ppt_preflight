@@ -14,13 +14,16 @@ Clone or download `av_preflight.py` — no other dependencies required.
 
 ```bash
 python av_preflight.py presentation.pptx
+python av_preflight.py presentation.pptx --display 3840x2160
 ```
+
+The `--display` flag sets the target display resolution for the aspect ratio check. Defaults to `1920x1080`.
 
 ## What it checks
 
 | Section | Details |
 |---|---|
-| **Deck overview** | Slide count, hidden slides, dimensions, aspect ratio, file size, show mode (presenter / kiosk / window), loop setting, sections |
+| **Deck overview** | Slide count, hidden slides, dimensions, aspect ratio, file size, show mode (presenter / kiosk / window), loop setting, sections; aspect ratio compared against target display (default 1920×1080) with letterbox/pillarbox warning on mismatch |
 | **Fonts** | Every explicit font name with per-slide locations; theme heading/body fonts from slide master; whether fonts are embedded in the file |
 | **Video** | Each video file — embedded vs. linked, format/extension, file size; codec warning for less-common formats |
 | **Audio** | Same as video |
@@ -128,8 +131,8 @@ Use [Pillow](https://pillow.readthedocs.io) to read each embedded image's pixel 
 ### Video codec / container report
 Pipe embedded video files through `ffprobe` (part of [ffmpeg](https://ffmpeg.org)) to report codec, resolution, frame rate, and bitrate. Useful for confirming H.264/AAC in an MP4 container — the most broadly supported format on event playback systems.
 
-### Aspect ratio vs display mismatch
-Accept a `--display WxH` argument (e.g. `--display 1920x1080`) and warn when the deck's aspect ratio doesn't match the target display. A 4:3 deck on a 16:9 screen (or vice versa) will show black bars or stretching unless the AV operator scales it correctly.
+### ~~Aspect ratio vs display mismatch~~ ✓ done
+Implemented — use `--display WxH` to override the default 1920×1080 target.
 
 ### SmartArt detection
 Flag slides containing SmartArt (`dgm:relIds` elements). SmartArt can render differently across Office versions and may not display at all in some presentation environments. Better to know in advance and have a rasterised fallback ready.

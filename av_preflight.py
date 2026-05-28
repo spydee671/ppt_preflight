@@ -8,11 +8,16 @@ animations, hidden slides, hyperlinks, and embedded objects.
 
 Usage:
     python av_preflight.py presentation.pptx
+    python av_preflight.py presentation.pptx --display 3840x2160
+
+The --display flag defaults to 1920x1080. The deck's aspect ratio is
+compared against the target display and a mismatch is flagged.
 
 Requires:
     pip install python-pptx
 """
 
+import argparse
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -59,6 +64,22 @@ def aspect_label(w_emu, h_emu):
         if abs(r - val) < 0.02:
             return name
     return f"custom ({r:.3f}:1)"
+
+
+def parse_display(value):
+    """Parse 'WxH' or 'W×H' into (width, height) integers."""
+    for sep in ('x', '×', 'X'):
+        if sep in value:
+            w, h = value.split(sep, 1)
+            return int(w.strip()), int(h.strip())
+    raise argparse.ArgumentTypeError(f"expected WxH format (e.g. 1920x1080), got: {value!r}")
+
+
+def aspect_match(deck_w_emu, deck_h_emu, disp_w, disp_h, tol=0.02):
+    """Return (match, deck_ratio, display_ratio)."""
+    deck_r = deck_w_emu / deck_h_emu
+    disp_r = disp_w / disp_h
+    return abs(deck_r - disp_r) < tol, deck_r, disp_r
 
 
 def section_header(title):
@@ -217,7 +238,7 @@ def presentation_sections(prs):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def analyze(path):
+def analyze(path, display_wh=(1920, 1080)):
     path = Path(path)
     if not path.exists():
         print(f"File not found: {path}")
@@ -247,6 +268,22 @@ def analyze(path):
     print(f"  Dimensions      {w_in:.2f}\" × {h_in:.2f}\"  "
           f"({w_px} × {h_px} px @ 96 dpi)")
     print(f"  Aspect ratio    {aspect_label(w_emu, h_emu)}")
+
+    disp_w, disp_h = display_wh
+    ratio_ok, deck_r, disp_r = aspect_match(w_emu, h_emu, disp_w, disp_h)
+    disp_label = f"{disp_w}×{disp_h}  ({aspect_label(disp_w, disp_h)})"
+    if ratio_ok:
+        match_str = "✓ matches"
+    else:
+        # Describe the visual consequence
+        if deck_r < disp_r:
+            consequence = "pillarboxed (black bars left/right)"
+        else:
+            consequence = "letterboxed (black bars top/bottom)"
+        match_str = f"✗ MISMATCH — {consequence}"
+    print(f"  Target display  {disp_label}")
+    print(f"  Ratio match     {match_str}")
+
     print(f"  File size       {fmt_size(path.stat().st_size)}")
     print(f"  Show mode       {show_props['mode']}")
     if show_props['loop']:
@@ -471,6 +508,13 @@ def analyze(path):
             f"{len(ext_links)} external hyperlink(s) — confirm internet access on event system"
         )
 
+    if not ratio_ok:
+        warnings.append(
+            f"Aspect ratio mismatch — deck is {aspect_label(w_emu, h_emu)}, "
+            f"display is {disp_w}×{disp_h} ({aspect_label(disp_w, disp_h)}) — "
+            f"will be {consequence}"
+        )
+
     print(f"\n{'━'*60}")
     print("PREFLIGHT SUMMARY")
     print("─" * 60)
@@ -487,7 +531,17 @@ def analyze(path):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
-    analyze(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description="AV preflight check for PowerPoint presentations.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('file', help='Path to the .pptx file')
+    parser.add_argument(
+        '--display',
+        metavar='WxH',
+        type=parse_display,
+        default=(1920, 1080),
+        help='Target display resolution (default: 1920x1080)',
+    )
+    args = parser.parse_args()
+    analyze(args.file, display_wh=args.display)
