@@ -165,6 +165,123 @@ def theme_font_names(prs):
     return names
 
 
+# ── Document properties ───────────────────────────────────────────────────────
+
+# AppVersion major number → Office release label
+_OFFICE_VERSION = {
+    '9':  'Office 2000',
+    '10': 'Office XP (2002)',
+    '11': 'Office 2003',
+    '12': 'Office 2007',
+    '14': 'Office 2010',
+    '15': 'Office 2013',
+    '16': 'Office 2016 / 2019 / 2021 / 365',
+}
+
+
+def _office_version_label(app_version_str):
+    """'16.0000' → 'Office 2016 / 2019 / 2021 / 365'"""
+    if not app_version_str:
+        return None
+    major = app_version_str.split('.')[0]
+    return _OFFICE_VERSION.get(major, f'v{app_version_str}')
+
+
+def _os_from_app(app_str):
+    """
+    Infer authoring OS from the Application string.
+    Returns 'Windows', 'macOS', 'Linux', or None.
+    """
+    if not app_str:
+        return None
+    low = app_str.lower()
+    # PowerPoint for Mac explicitly says 'macintosh'
+    if 'macintosh' in low:
+        return 'macOS'
+    # LibreOffice/Impress embeds the full platform: "LibreOffice/7.x$Linux_X86_64…"
+    if 'linux' in low:
+        return 'Linux'
+    if 'macosx' in low or 'darwin' in low:
+        return 'macOS'
+    # Plain "Microsoft Office PowerPoint" without 'macintosh' → Windows
+    if 'microsoft' in low:
+        return 'Windows'
+    return None
+
+
+def document_properties(zf):
+    """
+    Parse docProps/core.xml and docProps/app.xml from the zip.
+    Returns a dict with keys:
+      title, author, last_modified_by, created, modified, revision,
+      app_name, app_version, office_label, os_hint, company, presentation_format
+    All values may be None if absent.
+    """
+    import xml.etree.ElementTree as ET
+
+    CP  = 'http://schemas.openxmlformats.org/package/2006/metadata/core-properties'
+    DC  = 'http://purl.org/dc/elements/1.1/'
+    DCT = 'http://purl.org/dc/terms/'
+    APP = 'http://schemas.openxmlformats.org/officeDocument/2006/extended-properties'
+
+    props = dict(
+        title=None, author=None, last_modified_by=None,
+        created=None, modified=None, revision=None,
+        app_name=None, app_version=None, office_label=None,
+        os_hint=None, company=None, presentation_format=None,
+    )
+
+    # ── core.xml ──────────────────────────────────────────────────────────────
+    try:
+        raw = zf.read('docProps/core.xml')
+        root = ET.fromstring(raw)
+
+        def _text(tag_ns, tag_local):
+            el = root.find(f'{{{tag_ns}}}{tag_local}')
+            return el.text.strip() if el is not None and el.text else None
+
+        props['title']            = _text(DC,  'title')
+        props['author']           = _text(DC,  'creator')
+        props['last_modified_by'] = _text(CP,  'lastModifiedBy')
+        props['created']          = _text(DCT, 'created')
+        props['modified']         = _text(DCT, 'modified')
+        props['revision']         = _text(CP,  'revision')
+    except Exception:
+        pass
+
+    # ── app.xml ───────────────────────────────────────────────────────────────
+    try:
+        raw = zf.read('docProps/app.xml')
+        root = ET.fromstring(raw)
+
+        def _atext(tag_local):
+            el = root.find(f'{{{APP}}}{tag_local}')
+            return el.text.strip() if el is not None and el.text else None
+
+        props['app_name']            = _atext('Application')
+        props['app_version']         = _atext('AppVersion')
+        props['company']             = _atext('Company')
+        props['presentation_format'] = _atext('PresentationFormat')
+    except Exception:
+        pass
+
+    props['office_label'] = _office_version_label(props['app_version'])
+    props['os_hint']      = _os_from_app(props['app_name'])
+
+    return props
+
+
+def _fmt_datetime(iso_str):
+    """'2024-05-28T14:22:00Z' → '2024-05-28  14:22 UTC'"""
+    if not iso_str:
+        return None
+    try:
+        date, time = iso_str.rstrip('Z').split('T')
+        return f"{date}  {time[:5]} UTC"
+    except Exception:
+        return iso_str
+
+
 # ── Media extraction ──────────────────────────────────────────────────────────
 
 def _embedded_size(rel, zf):
@@ -583,6 +700,41 @@ def analyze(path, display_wh=(1920, 1080)):
         print(f"  Loop            YES")
     if sections:
         print(f"  Sections        {len(sections)}: {', '.join(sections)}")
+
+    # ── Document properties ────────────────────────────────────────────────────
+    doc = document_properties(zf)
+
+    section_header("DOCUMENT PROPERTIES")
+    if doc['title']:
+        print(f"  Title           {doc['title']}")
+    if doc['author']:
+        print(f"  Author          {doc['author']}")
+    if doc['last_modified_by'] and doc['last_modified_by'] != doc['author']:
+        print(f"  Last saved by   {doc['last_modified_by']}")
+    if doc['created']:
+        print(f"  Created         {_fmt_datetime(doc['created'])}")
+    if doc['modified']:
+        print(f"  Modified        {_fmt_datetime(doc['modified'])}")
+    if doc['revision']:
+        print(f"  Revision        {doc['revision']}")
+
+    # Application / authoring environment
+    app_str = doc['app_name'] or '?'
+    if doc['office_label']:
+        app_str += f"  ({doc['office_label']})"
+    if doc['os_hint']:
+        app_str += f"  [{doc['os_hint']}]"
+    print(f"  Application     {app_str}")
+
+    if doc['company']:
+        print(f"  Company         {doc['company']}")
+    if doc['presentation_format']:
+        print(f"  Format          {doc['presentation_format']}")
+
+    # Warn if the authoring app is not PowerPoint (LibreOffice, Keynote, etc.)
+    if doc['app_name'] and 'microsoft' not in doc['app_name'].lower():
+        print(f"\n  ⚠  Not authored in Microsoft PowerPoint — "
+              f"verify rendering on the event system")
 
     # ── Fonts ──────────────────────────────────────────────────────────────────
     fonts = defaultdict(set)
