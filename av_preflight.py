@@ -18,6 +18,7 @@ Requires:
 """
 
 import argparse
+import struct
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -487,6 +488,136 @@ def get_video_playback_props(slide, shape_id):
     return None  # shape referenced in no timing block
 
 
+# ── Video codec detection ─────────────────────────────────────────────────────
+
+_CODEC_LABELS = {
+    'avc1': 'H.264',   'avc3': 'H.264',
+    'hvc1': 'H.265',   'hev1': 'H.265',
+    'av01': 'AV1',
+    'vp08': 'VP8',     'vp09': 'VP9',
+    'apch': 'ProRes',  'apcn': 'ProRes',  'apcs': 'ProRes',
+    'apco': 'ProRes',  'ap4h': 'ProRes',  'ap4x': 'ProRes',
+    'dvh1': 'Dolby Vision',  'dvhe': 'Dolby Vision',
+    'mp4v': 'MPEG-4',
+    'mjp2': 'Motion JPEG',   'jpeg': 'Motion JPEG',
+    'h263': 'H.263',   's263': 'H.263',
+}
+
+_CODEC_SAFE = {'H.264', 'MPEG-4'}
+
+_CODEC_WARN = {
+    'H.265':         'hardware decode required — may fail on older event systems',
+    'ProRes':        'Apple codec — will NOT play on Windows without QuickTime or a codec pack',
+    'AV1':           'limited support — not recommended for live events',
+    'VP8':           'web codec — unlikely to play in PowerPoint on Windows',
+    'VP9':           'web codec — unlikely to play in PowerPoint on Windows',
+    'Dolby Vision':  'HDR — may not render correctly on standard displays',
+    'Motion JPEG':   'large file size — verify playback on event system',
+    'H.263':         'legacy codec — verify playback on event system',
+    'WMV':           'Windows-only — will not play on macOS without a codec',
+    'AVI':           'container only — codec unknown; verify playback on event system',
+    'WebM/MKV':      'open web format — not reliably supported in PowerPoint',
+}
+
+_CODEC_PROBE_BYTES = 256 * 1024  # read first 256 KB — enough for moov at start of file
+
+
+def _probe_mp4_codec(data: bytes):
+    """Parse ISOBMFF (MP4/MOV) bytes and return the video codec label or raw fourcc."""
+    def _iter(buf, start, end):
+        pos = start
+        while pos + 8 <= end:
+            sz = struct.unpack_from('>I', buf, pos)[0]
+            try:
+                bt = buf[pos+4:pos+8].decode('ascii')
+            except Exception:
+                return
+            if sz == 1:                   # 64-bit extended size
+                if pos + 16 > end:
+                    return
+                sz  = struct.unpack_from('>Q', buf, pos+8)[0]
+                hdr = 16
+            elif sz == 0:                 # box runs to EOF
+                sz  = end - pos
+                hdr = 8
+            else:
+                hdr = 8
+            if sz < hdr or pos + sz > end:
+                return
+            yield bt, pos + hdr, pos + sz
+            pos += sz
+
+    def _find(buf, start, end, *path):
+        cs, ce = start, end
+        for name in path:
+            for bt, bs, be in _iter(buf, cs, ce):
+                if bt == name:
+                    cs, ce = bs, be
+                    break
+            else:
+                return None, None
+        return cs, ce
+
+    n = len(data)
+    # Locate moov box
+    moov_s = moov_e = None
+    for bt, bs, be in _iter(data, 0, n):
+        if bt == 'moov':
+            moov_s, moov_e = bs, be
+            break
+    if moov_s is None:
+        return None   # moov not in first 256 KB (non-fast-start file)
+
+    # Walk trak boxes looking for the video track
+    for bt, bs, be in _iter(data, moov_s, moov_e):
+        if bt != 'trak':
+            continue
+        mdia_s, mdia_e = _find(data, bs, be, 'mdia')
+        if mdia_s is None:
+            continue
+        # hdlr handler_type must be 'vide'
+        hdlr_s, _ = _find(data, mdia_s, mdia_e, 'hdlr')
+        if hdlr_s is None or hdlr_s + 12 > n:
+            continue
+        # hdlr content: version(1) + flags(3) + pre_defined(4) + handler_type(4)
+        if data[hdlr_s+8:hdlr_s+12] != b'vide':
+            continue
+        # Navigate to stsd (sample description — contains codec fourcc)
+        stsd_s, stsd_e = _find(data, mdia_s, mdia_e, 'minf', 'stbl', 'stsd')
+        if stsd_s is None:
+            continue
+        # stsd content: version(1) + flags(3) + entry_count(4) + first entry...
+        entry = stsd_s + 8
+        if entry + 8 > stsd_e:
+            continue
+        # First sample entry: size(4) + codec_fourcc(4)
+        try:
+            fourcc = data[entry+4:entry+8].decode('ascii').strip()
+            return _CODEC_LABELS.get(fourcc, fourcc)
+        except Exception:
+            continue
+    return None
+
+
+def _video_codec(rel, zf, ext: str):
+    """Detect codec for an embedded video. Returns a label string or None."""
+    try:
+        if ext in ('.mp4', '.mov', '.m4v'):
+            zip_path = str(rel.target_part.partname).lstrip('/')
+            with zf.open(zip_path) as f:
+                data = f.read(_CODEC_PROBE_BYTES)
+            return _probe_mp4_codec(data)
+        if ext == '.wmv':
+            return 'WMV'
+        if ext == '.avi':
+            return 'AVI'
+        if ext in ('.mkv', '.webm'):
+            return 'WebM/MKV'
+    except Exception:
+        pass
+    return None
+
+
 def find_video_shapes(slide, slide_num, zf):
     """
     Detect video shapes by looking for the p14:media extension inside p:nvPr.
@@ -521,8 +652,9 @@ def find_video_shapes(slide, slide_num, zf):
             ext    = PurePosixPath(target).suffix.lower()
             if ext not in VIDEO_EXTENSIONS:
                 continue
-            name = PurePosixPath(target).name
-            size = _embedded_size(rel, zf) if embedded else None
+            name  = PurePosixPath(target).name
+            size  = _embedded_size(rel, zf) if embedded else None
+            codec = _video_codec(rel, zf, ext) if embedded else None
         except Exception:
             continue
 
@@ -536,6 +668,7 @@ def find_video_shapes(slide, slide_num, zf):
             embedded    = embedded,
             linked_path = target if not embedded else None,
             size        = size,
+            codec       = codec,
             autoplay    = props['autoplay'] if props else None,
             loop        = props['loop']     if props else None,
             muted       = props['muted']    if props else None,
@@ -813,6 +946,7 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
                     embedded    = embedded,
                     linked_path = target if rel.is_external else None,
                     size        = _embedded_size(rel, zf) if embedded else None,
+                    codec       = _video_codec(rel, zf, ext) if embedded else None,
                     autoplay    = None,
                     loop        = None,
                     muted       = None,
@@ -840,9 +974,10 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
     if not all_videos:
         print("  (none)")
     else:
-        print(f"  {'Slide':>5}  {'File':<30}  {'Source':<9}  "
-              f"{'Autoplay':<8}  {'Loop':<5}  {'Mute':<5}  Size")
-        print(f"  {'─'*5}  {'─'*30}  {'─'*9}  {'─'*8}  {'─'*5}  {'─'*5}  {'─'*10}")
+        print(f"  {'Slide':>5}  {'File':<30}  {'Source':<9}  {'Codec':<14}"
+              f"  {'Autoplay':<8}  {'Loop':<5}  {'Mute':<5}  Size")
+        print(f"  {'─'*5}  {'─'*30}  {'─'*9}  {'─'*14}"
+              f"  {'─'*8}  {'─'*5}  {'─'*5}  {'─'*10}")
         has_unknown = any(v['autoplay'] is None for v in all_videos)
         for v in all_videos:
             source   = "embedded" if v['embedded'] else "linked ⚠"
@@ -851,9 +986,15 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
             loop_str = "?"   if v['loop']  is None else ("yes" if v['loop']  else "no")
             mute_str = "?"   if v['muted'] is None else ("yes" if v['muted'] else "no")
             sz_str   = fmt_size(v['size']) if v['size'] else "—"
-            codec_w  = "  ⚠ codec?" if v['ext'] not in SAFE_VIDEO_FORMATS else ""
-            print(f"  {v['slide']:>5}  {v['name']:<30}  {source:<9}  "
-                  f"{ap_str:<8}  {loop_str:<5}  {mute_str:<5}  {sz_str}{codec_w}")
+            codec    = v.get('codec')
+            if codec is None:
+                codec_str = "—" if v['embedded'] else "n/a (linked)"
+            elif codec in _CODEC_WARN:
+                codec_str = f"{codec} ⚠"
+            else:
+                codec_str = codec
+            print(f"  {v['slide']:>5}  {v['name']:<30}  {source:<9}  {codec_str:<14}"
+                  f"  {ap_str:<8}  {loop_str:<5}  {mute_str:<5}  {sz_str}")
             if v.get('linked_path'):
                 print(f"         ↳ {v['linked_path']}")
         no_autoplay_v = [v for v in all_videos if v['autoplay'] is False]
@@ -1104,13 +1245,22 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
             f"will not display on a different machine"
         )
 
-    unsafe_vid = [v for v in all_videos if v['embedded'] and v['ext'] not in SAFE_VIDEO_FORMATS]
-    if unsafe_vid:
-        fmts = ', '.join(sorted(set(v['ext'] for v in unsafe_vid)))
-        warnings.append(
-            f"Video format(s) {fmts} on slides {_slide_list(unsafe_vid)} — "
-            f"may need a codec; prefer .mp4/.mov"
-        )
+    # Codec warnings — group by codec so each gets its specific advisory
+    _CODEC_FAIL = {'ProRes', 'WMV', 'WebM/MKV'}   # likely to fail outright
+    _codec_groups = defaultdict(list)
+    for v in all_videos:
+        c = v.get('codec')
+        if c and c in _CODEC_WARN:
+            _codec_groups[c].append(v)
+        elif v['embedded'] and v['ext'] not in SAFE_VIDEO_FORMATS and not c:
+            _codec_groups[v['ext']].append(v)  # extension fallback
+    for codec_label, vids in sorted(_codec_groups.items()):
+        advice = _CODEC_WARN.get(codec_label, 'verify codec support on event system')
+        msg = f"{len(vids)} {codec_label} video(s) on slides {_slide_list(vids)} — {advice}"
+        if codec_label in _CODEC_FAIL:
+            issues.append(msg)
+        else:
+            warnings.append(msg)
 
     no_autoplay_vids = [v for v in all_videos if v.get('autoplay') is False]
     if no_autoplay_vids:
