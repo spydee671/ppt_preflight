@@ -614,7 +614,6 @@ _FFPROBE_CODEC_MAP = {
     'theora':      'Theora',
 }
 
-_FFPROBE_SIZE_LIMIT = 500 * 1024 * 1024  # skip extraction for files > 500 MB
 _ffprobe_exe = None   # lazily resolved: False = not found, str = path
 
 
@@ -632,9 +631,6 @@ def _ffprobe_codec(rel, zf, ext: str):
         return None
     try:
         zip_path = str(rel.target_part.partname).lstrip('/')
-        file_size = zf.getinfo(zip_path).file_size
-        if file_size > _FFPROBE_SIZE_LIMIT:
-            return None   # too large to extract
         suffix = ext if ext.startswith('.') else f'.{ext}'
         fd, tmp_path = tempfile.mkstemp(suffix=suffix)
         try:
@@ -646,7 +642,7 @@ def _ffprobe_codec(rel, zf, ext: str):
                  '-show_entries', 'stream=codec_name',
                  '-of', 'default=noprint_wrappers=1:nokey=1',
                  tmp_path],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=120,
             )
             codec_raw = result.stdout.strip().lower()
             if codec_raw:
