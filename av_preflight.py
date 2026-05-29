@@ -373,8 +373,12 @@ def get_video_playback_props(slide, shape_id):
 def find_video_shapes(slide, slide_num, zf):
     """
     Detect video shapes by looking for the p14:media extension inside p:nvPr.
-    Returns a list of video dicts, each containing '_rId' for deduplication.
+    Returns a list of video dicts, each containing '_target' for deduplication.
     Playback properties are resolved via get_video_playback_props().
+
+    Note: modern PPTX stores each embedded video in TWO relationships — a
+    'media' reltype (used by p14:media) and a legacy 'video' reltype.  Both
+    point to the same file, so deduplication must be by target URL, not rId.
     """
     results = []
     for shape in slide.shapes:
@@ -418,7 +422,7 @@ def find_video_shapes(slide, slide_num, zf):
             autoplay    = props['autoplay'] if props else None,
             loop        = props['loop']     if props else None,
             muted       = props['muted']    if props else None,
-            _rId        = rId,               # internal — stripped in analyze()
+            _target     = target,            # internal — stripped in analyze()
         ))
 
     return results
@@ -621,14 +625,16 @@ def analyze(path, display_wh=(1920, 1080)):
     all_images = []
 
     for i, slide in enumerate(prs.slides, 1):
-        # Shape-based detection gives autoplay / loop / muted
-        shape_vids = find_video_shapes(slide, i, zf)
-        shape_rIds = {v.pop('_rId') for v in shape_vids}
+        # Shape-based detection gives autoplay / loop / muted.
+        # Dedup by target URL: modern PPTX stores each embedded video in both
+        # a 'media' reltype (used by p14:media) AND a legacy 'video' reltype —
+        # same file, different rIds, so we match on the resolved target path.
+        shape_vids    = find_video_shapes(slide, i, zf)
+        shape_targets = {v.pop('_target') for v in shape_vids}
         all_videos.extend(shape_vids)
 
-        # Relationship scan: audio + any videos without a shape element
+        # Relationship scan: audio + any videos not already found via shapes
         for rel in slide.part.rels.values():
-            rId    = rel.rId
             rt     = rel.reltype.lower()
             target = rel.target_ref
             ext    = PurePosixPath(target).suffix.lower()
@@ -644,8 +650,8 @@ def analyze(path, display_wh=(1920, 1080)):
                     linked_path = target if rel.is_external else None,
                     size        = _embedded_size(rel, zf) if embedded else None,
                 ))
-            elif ('video' in rt or ext in VIDEO_EXTENSIONS) and rId not in shape_rIds:
-                # Linked/embedded video with no p14:media shape (legacy or bare rel)
+            elif ('video' in rt or ext in VIDEO_EXTENSIONS) and target not in shape_targets:
+                # Video rel with no matching shape (legacy deck or bare relationship)
                 embedded = not rel.is_external
                 all_videos.append(dict(
                     slide       = i,
