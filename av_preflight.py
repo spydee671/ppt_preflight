@@ -196,7 +196,8 @@ _PPI_LOW    = 96   # below this may look blurry on a standard monitor
 _PPI_HIGH   = 300  # above this is print resolution — no visible benefit on screen
 _PPI_TARGET = 192  # used to suggest ideal pixel dimensions (good for HiDPI/Retina)
 
-R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+R_NS   = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+P14_NS = 'http://schemas.microsoft.com/office/powerpoint/2010/main'
 
 
 def image_ppi_issues(prs):
@@ -264,6 +265,130 @@ def image_ppi_issues(prs):
                 continue
 
     return issues, checked
+
+
+# ── Video shape detection ─────────────────────────────────────────────────────
+
+def get_video_playback_props(slide, shape_id):
+    """
+    Parse the slide's p:timing to determine autoplay / loop / muted for a video shape.
+
+    PowerPoint stores media triggers inside the mainSeq timeline.  The OUTER
+    p:par (direct child of mainSeq's childTnLst) controls when playback starts:
+      • stCondLst/cond delay="0" with no evt → fires on slide entry → autoplay
+      • stCondLst/cond delay="indefinite"    → waits for click  → not autoplay
+
+    repeatCount="indefinite" on that outer cTn = loop.
+    A p:cmd type="call" cmd="setVolume(0)" targeting the shape = muted.
+
+    Returns dict(autoplay, loop, muted), or None if no timing block found.
+    """
+    sid    = str(shape_id)
+    timing = slide.element.find(qn('p:timing'))
+    if timing is None:
+        return None
+
+    # Find the mainSeq container node
+    main_cTn = None
+    for cTn in timing.findall('.//' + qn('p:cTn')):
+        if cTn.get('nodeType') == 'mainSeq':
+            main_cTn = cTn
+            break
+    if main_cTn is None:
+        return None
+
+    child_lst = main_cTn.find(qn('p:childTnLst'))
+    if child_lst is None:
+        return None
+
+    for outer_par in child_lst.findall(qn('p:par')):
+        # Check whether this block references our video shape at all
+        if not any(sp.get('spid') == sid
+                   for sp in outer_par.findall('.//' + qn('p:spTgt'))):
+            continue
+
+        outer_cTn = outer_par.find(qn('p:cTn'))
+        if outer_cTn is None:
+            continue
+
+        # Autoplay: outer stCondLst has <p:cond delay="0"> with NO evt attribute
+        autoplay = False
+        stCond = outer_cTn.find(qn('p:stCondLst'))
+        if stCond is not None:
+            for cond in stCond.findall(qn('p:cond')):
+                if cond.get('delay') == '0' and cond.get('evt') is None:
+                    autoplay = True
+                    break
+
+        # Loop: repeatCount="indefinite" on the outer cTn
+        loop = outer_cTn.get('repeatCount') == 'indefinite'
+
+        # Mute: any p:cmd setVolume(0) targeting our shape
+        muted = False
+        for cmd in outer_par.findall('.//' + qn('p:cmd')):
+            if cmd.get('type') == 'call' and cmd.get('cmd') == 'setVolume(0)':
+                if any(sp.get('spid') == sid
+                       for sp in cmd.findall('.//' + qn('p:spTgt'))):
+                    muted = True
+                    break
+
+        return dict(autoplay=autoplay, loop=loop, muted=muted)
+
+    return None  # shape referenced in no timing block
+
+
+def find_video_shapes(slide, slide_num, zf):
+    """
+    Detect video shapes by looking for the p14:media extension inside p:nvPr.
+    Returns a list of video dicts, each containing '_rId' for deduplication.
+    Playback properties are resolved via get_video_playback_props().
+    """
+    results = []
+    for shape in slide.shapes:
+        nvPr = shape.element.find('.//' + qn('p:nvPr'))
+        if nvPr is None:
+            continue
+
+        media_el = nvPr.find(f'.//{{{P14_NS}}}media')
+        if media_el is None:
+            continue
+
+        rId_link  = media_el.get(f'{{{R_NS}}}link')
+        rId_embed = media_el.get(f'{{{R_NS}}}embed')
+        rId       = rId_link or rId_embed
+        embedded  = rId_embed is not None
+
+        if rId is None:
+            continue
+
+        try:
+            rel    = slide.part.rels[rId]
+            target = rel.target_ref
+            ext    = PurePosixPath(target).suffix.lower()
+            if ext not in VIDEO_EXTENSIONS:
+                continue
+            name = PurePosixPath(target).name
+            size = _embedded_size(rel, zf) if embedded else None
+        except Exception:
+            continue
+
+        props = get_video_playback_props(slide, shape.shape_id)
+
+        results.append(dict(
+            slide       = slide_num,
+            kind        = 'video',
+            name        = name,
+            ext         = ext,
+            embedded    = embedded,
+            linked_path = target if not embedded else None,
+            size        = size,
+            autoplay    = props['autoplay'] if props else None,
+            loop        = props['loop']     if props else None,
+            muted       = props['muted']    if props else None,
+            _rId        = rId,               # internal — stripped in analyze()
+        ))
+
+    return results
 
 
 # ── Transitions & animations ──────────────────────────────────────────────────
@@ -457,36 +582,95 @@ def analyze(path, display_wh=(1920, 1080)):
         print(f"\n  ⚠  No embedded fonts — all fonts must be installed on "
               f"the playback machine")
 
-    # ── Video ──────────────────────────────────────────────────────────────────
-    all_media  = []
+    # ── Media ──────────────────────────────────────────────────────────────────
+    all_videos = []
+    all_audios = []
     all_images = []
+
     for i, slide in enumerate(prs.slides, 1):
-        all_media.extend(slide_media(slide, i, zf))
+        # Shape-based detection gives autoplay / loop / muted
+        shape_vids = find_video_shapes(slide, i, zf)
+        shape_rIds = {v.pop('_rId') for v in shape_vids}
+        all_videos.extend(shape_vids)
+
+        # Relationship scan: audio + any videos without a shape element
+        for rel in slide.part.rels.values():
+            rId    = rel.rId
+            rt     = rel.reltype.lower()
+            target = rel.target_ref
+            ext    = PurePosixPath(target).suffix.lower()
+
+            if 'audio' in rt or ext in AUDIO_EXTENSIONS:
+                embedded = not rel.is_external
+                all_audios.append(dict(
+                    slide       = i,
+                    kind        = 'audio',
+                    name        = PurePosixPath(target).name,
+                    ext         = ext,
+                    embedded    = embedded,
+                    linked_path = target if rel.is_external else None,
+                    size        = _embedded_size(rel, zf) if embedded else None,
+                ))
+            elif ('video' in rt or ext in VIDEO_EXTENSIONS) and rId not in shape_rIds:
+                # Linked/embedded video with no p14:media shape (legacy or bare rel)
+                embedded = not rel.is_external
+                all_videos.append(dict(
+                    slide       = i,
+                    kind        = 'video',
+                    name        = PurePosixPath(target).name,
+                    ext         = ext,
+                    embedded    = embedded,
+                    linked_path = target if rel.is_external else None,
+                    size        = _embedded_size(rel, zf) if embedded else None,
+                    autoplay    = None,
+                    loop        = None,
+                    muted       = None,
+                ))
+
         all_images.extend(slide_images(slide, i, zf))
 
-    videos = [m for m in all_media if m['kind'] == 'video']
-    audios  = [m for m in all_media if m['kind'] == 'audio']
+    # ── VIDEO section — chart-style table ──────────────────────────────────────
+    section_header(f"VIDEO  ({len(all_videos)})")
+    if not all_videos:
+        print("  (none)")
+    else:
+        print(f"  {'Slide':>5}  {'File':<30}  {'Source':<9}  "
+              f"{'Autoplay':<8}  {'Loop':<5}  {'Mute':<5}  Size")
+        print(f"  {'─'*5}  {'─'*30}  {'─'*9}  {'─'*8}  {'─'*5}  {'─'*5}  {'─'*10}")
+        for v in all_videos:
+            source   = "embedded" if v['embedded'] else "linked ⚠"
+            ap_str   = ("—"     if v['autoplay'] is None
+                        else "YES" if v['autoplay'] else "NO ⚠")
+            loop_str = "—" if v['loop']  is None else ("yes" if v['loop']  else "no")
+            mute_str = "—" if v['muted'] is None else ("yes" if v['muted'] else "no")
+            sz_str   = fmt_size(v['size']) if v['size'] else "—"
+            codec_w  = "  ⚠ codec?" if v['ext'] not in SAFE_VIDEO_FORMATS else ""
+            print(f"  {v['slide']:>5}  {v['name']:<30}  {source:<9}  "
+                  f"{ap_str:<8}  {loop_str:<5}  {mute_str:<5}  {sz_str}{codec_w}")
+            if v.get('linked_path'):
+                print(f"         ↳ {v['linked_path']}")
+        no_autoplay_v = [v for v in all_videos if v['autoplay'] is False]
+        if no_autoplay_v:
+            print(f"\n  ⚠  {len(no_autoplay_v)} video(s) not set to autoplay — "
+                  f"will require a manual click or trigger to start")
 
-    def print_media_section(label, items):
-        section_header(f"{label}  ({len(items)})")
+    # ── AUDIO ──────────────────────────────────────────────────────────────────
+    def print_audio_section(items):
+        section_header(f"AUDIO  ({len(items)})")
         if not items:
             print("  (none)")
             return
         for m in items:
-            status = "embedded" if m['embedded'] else "LINKED ⚠"
-            sz     = f"  [{fmt_size(m['size'])}]" if m['size'] else ""
-            fmt_warn = ""
-            if m['kind'] == 'video' and m['ext'] not in SAFE_VIDEO_FORMATS:
-                fmt_warn = "  ⚠ format may need codec"
-            if m['kind'] == 'audio' and m['ext'] not in SAFE_AUDIO_FORMATS:
-                fmt_warn = "  ⚠ check codec support"
+            status   = "embedded" if m['embedded'] else "LINKED ⚠"
+            sz       = f"  [{fmt_size(m['size'])}]" if m['size'] else ""
+            fmt_warn = ("  ⚠ check codec support"
+                        if m['ext'] not in SAFE_AUDIO_FORMATS else "")
             print(f"  slide {m['slide']:>2}  {status:<12}  "
                   f"{m['ext']:<6}  {m['name']}{sz}{fmt_warn}")
             if not m['embedded']:
                 print(f"           ↳ linked path: {m['linked_path']}")
 
-    print_media_section("VIDEO", videos)
-    print_media_section("AUDIO", audios)
+    print_audio_section(all_audios)
 
     # ── Images ─────────────────────────────────────────────────────────────────
     # Deduplicate by filename (same asset used on multiple slides)
@@ -651,28 +835,42 @@ def analyze(path, display_wh=(1920, 1080)):
     issues   = []
     warnings = []
 
-    linked_v = [m for m in videos if not m['embedded']]
-    linked_a = [m for m in audios if not m['embedded']]
+    linked_v = [v for v in all_videos if not v['embedded']]
+    linked_a = [v for v in all_audios if not v['embedded']]
 
     if linked_v:
         issues.append(
             f"{len(linked_v)} linked video(s) — will break on a different machine: "
-            f"{', '.join(m['name'] for m in linked_v)}"
+            f"{', '.join(v['name'] for v in linked_v)}"
         )
     if linked_a:
         issues.append(
             f"{len(linked_a)} linked audio file(s) — will break on a different machine: "
-            f"{', '.join(m['name'] for m in linked_a)}"
+            f"{', '.join(v['name'] for v in linked_a)}"
         )
     if linked_imgs:
         issues.append(
             f"{len(linked_imgs)} linked image(s) — may not display on a different machine"
         )
 
-    unsafe_vid = [m for m in videos if m['embedded'] and m['ext'] not in SAFE_VIDEO_FORMATS]
+    unsafe_vid = [v for v in all_videos if v['embedded'] and v['ext'] not in SAFE_VIDEO_FORMATS]
     if unsafe_vid:
-        fmts = ', '.join(set(m['ext'] for m in unsafe_vid))
+        fmts = ', '.join(set(v['ext'] for v in unsafe_vid))
         warnings.append(f"Video format(s) {fmts} may need a codec — prefer .mp4/.mov")
+
+    no_autoplay_vids = [v for v in all_videos if v.get('autoplay') is False]
+    if no_autoplay_vids:
+        warnings.append(
+            f"{len(no_autoplay_vids)} video(s) not set to autoplay — "
+            f"require manual click to start: "
+            f"{', '.join(v['name'] for v in no_autoplay_vids)}"
+        )
+    unknown_ap_vids = [v for v in all_videos if v.get('autoplay') is None]
+    if unknown_ap_vids:
+        warnings.append(
+            f"{len(unknown_ap_vids)} video(s) with no playback shape detected — "
+            f"verify autoplay/loop/mute settings on event system"
+        )
 
     if not embedded_font_files and fonts:
         font_list = ', '.join(sorted(fonts)[:6])

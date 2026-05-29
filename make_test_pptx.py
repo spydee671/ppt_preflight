@@ -179,35 +179,174 @@ def slide2_image(prs):
     return slide
 
 
+def _add_video_pic(slide, shape_id, rId, x, y, w, h, fill_hex='1A1A2E'):
+    """
+    Inject a p:pic video shape into the slide's shape tree.
+    Uses p14:media with r:link (linked video) in the nvPr extension.
+    """
+    P_NS   = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+    A_NS   = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    R_NS   = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    P14_NS = 'http://schemas.microsoft.com/office/powerpoint/2010/main'
+
+    pic_xml = f'''<p:pic
+            xmlns:p="{P_NS}" xmlns:a="{A_NS}"
+            xmlns:r="{R_NS}" xmlns:p14="{P14_NS}">
+      <p:nvPicPr>
+        <p:cNvPr id="{shape_id}" name="Video {shape_id}"/>
+        <p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr>
+        <p:nvPr>
+          <p:extLst>
+            <p:ext uri="{{DAA4B4D4-6D71-4841-9C94-3317A9D6C41F}}">
+              <p14:media r:link="{rId}"/>
+            </p:ext>
+          </p:extLst>
+        </p:nvPr>
+      </p:nvPicPr>
+      <p:blipFill>
+        <a:blip/><a:stretch><a:fillRect/></a:stretch>
+      </p:blipFill>
+      <p:spPr>
+        <a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{w}" cy="{h}"/></a:xfrm>
+        <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+        <a:solidFill><a:srgbClr val="{fill_hex}"/></a:solidFill>
+      </p:spPr>
+    </p:pic>'''
+    slide.shapes._spTree.append(etree.fromstring(pic_xml))
+
+
+def _add_video_timing(slide, video_specs):
+    """
+    Build and inject a p:timing element for one or more video shapes.
+
+    video_specs: list of dicts — {shape_id, autoplay, loop, muted}
+
+    Trigger logic:
+      autoplay=True  → <p:cond delay="0"/>   fires immediately on slide entry
+      autoplay=False → <p:cond delay="indefinite"/>  waits for user click
+    Loop:  repeatCount="indefinite" on the outer p:cTn
+    Mute:  extra p:cmd setVolume(0) targeting the shape
+    """
+    P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+
+    sld = slide.element
+    for old in sld.findall(qn('p:timing')):
+        sld.remove(old)
+
+    par_blocks = []
+    for i, spec in enumerate(video_specs):
+        sid     = str(spec['shape_id'])
+        b       = 100 + i * 20
+        trigger = '<p:cond delay="0"/>' if spec['autoplay'] else '<p:cond delay="indefinite"/>'
+        repeat  = ' repeatCount="indefinite"' if spec['loop'] else ''
+        mute_cmd = (
+            f'<p:cmd type="call" cmd="setVolume(0)">'
+            f'<p:cBhvr><p:cTn id="{b+3}" dur="1"/>'
+            f'<p:tgtEl><p:spTgt spid="{sid}"/></p:tgtEl></p:cBhvr></p:cmd>'
+            if spec['muted'] else ''
+        )
+        par_blocks.append(f'''
+        <p:par xmlns:p="{P_NS}">
+          <p:cTn id="{b}" fill="hold"{repeat}>
+            <p:stCondLst>{trigger}</p:stCondLst>
+            <p:childTnLst>
+              <p:par>
+                <p:cTn id="{b+1}" fill="hold" nodeType="clickEffect">
+                  <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                  <p:childTnLst>
+                    <p:cmd type="call" cmd="playFrom(0.0)">
+                      <p:cBhvr>
+                        <p:cTn id="{b+2}" dur="10000"/>
+                        <p:tgtEl><p:spTgt spid="{sid}"/></p:tgtEl>
+                      </p:cBhvr>
+                    </p:cmd>
+                    {mute_cmd}
+                  </p:childTnLst>
+                </p:cTn>
+              </p:par>
+            </p:childTnLst>
+          </p:cTn>
+        </p:par>''')
+
+    timing_xml = f'''<p:timing xmlns:p="{P_NS}">
+      <p:tnLst>
+        <p:par>
+          <p:cTn id="10" dur="indefinite" restart="whenNotActive" nodeType="tmRoot">
+            <p:childTnLst>
+              <p:seq concurrent="1" nextAc="seek">
+                <p:cTn id="11" dur="indefinite" nodeType="mainSeq">
+                  <p:childTnLst>{''.join(par_blocks)}</p:childTnLst>
+                </p:cTn>
+                <p:prevCondLst><p:cond evt="onPrevNode" delay="0"/></p:prevCondLst>
+                <p:nextCondLst><p:cond evt="onNextNode" delay="0"/></p:nextCondLst>
+              </p:seq>
+            </p:childTnLst>
+          </p:cTn>
+        </p:par>
+      </p:tnLst>
+    </p:timing>'''
+
+    timing_elem = etree.fromstring(timing_xml)
+    insert_at = len(sld)
+    for i, child in enumerate(sld):
+        if child.tag.split('}')[-1] == 'extLst':
+            insert_at = i
+            break
+    sld.insert(insert_at, timing_elem)
+
+
 def slide3_media(prs):
-    """Media slide — linked video + linked audio, push transition, auto-advance."""
-    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    """
+    Media slide — two video shapes with contrasting playback settings + linked audio.
 
-    title = slide.shapes.title
-    title.text = "Linked Media (Video + Audio)"
-    title.text_frame.paragraphs[0].runs[0].font.name = 'Trebuchet MS'
-    title.text_frame.paragraphs[0].runs[0].font.size = Pt(32)
+    Video 1 (left):  autoplay, not muted, no loop  → the ideal AV setup
+    Video 2 (right): click-to-play, muted, looping → exercises all warning paths
+    """
+    slide = prs.slides.add_slide(prs.slide_layouts[5])  # blank
 
-    body = slide.placeholders[1]
-    body.text = ("This slide references a linked video and a linked audio file.\n"
-                 "Both will be flagged as LINKED by the preflight tool.")
-    body.text_frame.paragraphs[0].runs[0].font.name = 'Trebuchet MS'
+    # Title
+    tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.25), Inches(9), Inches(0.75))
+    run = tb.text_frame.paragraphs[0].add_run()
+    run.text = "Video Playback Settings Test"
+    run.font.name = 'Trebuchet MS'
+    run.font.size = Pt(28)
 
-    # Linked video — external relationship (simulates a non-embedded video file)
-    slide.part.relate_to(
-        'C:/Users/Presenter/Videos/event_intro.mp4',
-        VIDEO_RELTYPE,
-        is_external=True,
-    )
+    # Labels
+    for x_off, txt in ((0.5, "VIDEO 1 — autoplay · not muted · no loop"),
+                        (5.2, "VIDEO 2 — click-to-play · muted · looping")):
+        lb = slide.shapes.add_textbox(Inches(x_off), Inches(1.2), Inches(4.5), Inches(0.4))
+        lr = lb.text_frame.paragraphs[0].add_run()
+        lr.text = txt
+        lr.font.name = 'Trebuchet MS'
+        lr.font.size = Pt(11)
 
-    # Linked audio — external relationship
-    slide.part.relate_to(
-        'C:/Users/Presenter/Music/background.mp3',
-        AUDIO_RELTYPE,
-        is_external=True,
-    )
+    # Assign shape IDs that won't clash with existing placeholder IDs
+    max_id  = max(s.shape_id for s in slide.shapes)
+    vid1_id = max_id + 1
+    vid2_id = max_id + 2
 
-    add_transition(slide, kind='push', dur_ms=500, auto_advance_ms=8000)
+    # Linked video relationships
+    rId1 = slide.part.relate_to('C:/Videos/event_intro.mp4',  VIDEO_RELTYPE, is_external=True)
+    rId2 = slide.part.relate_to('C:/Videos/bg_ambient.mp4',   VIDEO_RELTYPE, is_external=True)
+
+    # Linked audio
+    slide.part.relate_to('C:/Music/background.mp3', AUDIO_RELTYPE, is_external=True)
+
+    # Video shapes (dark placeholder rectangles)
+    _add_video_pic(slide, vid1_id, rId1,
+                   int(Inches(0.5)), int(Inches(1.75)),
+                   int(Inches(4.2)), int(Inches(2.4)), fill_hex='1A1A2E')
+    _add_video_pic(slide, vid2_id, rId2,
+                   int(Inches(5.2)), int(Inches(1.75)),
+                   int(Inches(4.2)), int(Inches(2.4)), fill_hex='2E1A1A')
+
+    # Timing: one autoplay, one click / loop / muted
+    _add_video_timing(slide, [
+        dict(shape_id=vid1_id, autoplay=True,  loop=False, muted=False),
+        dict(shape_id=vid2_id, autoplay=False, loop=True,  muted=True),
+    ])
+
+    add_transition(slide, kind='push', dur_ms=500)
     return slide
 
 
@@ -287,7 +426,7 @@ def build():
     print(f"Written: {OUT}")
     print(f"  5 slides")
     print(f"  Fonts:       Georgia, Calibri, Arial, Gill Sans MT, Trebuchet MS, Impact, Helvetica Neue, Courier New")
-    print(f"  Media:       1 linked video, 1 linked audio")
+    print(f"  Media:       2 linked videos (autoplay+normal; loop+mute), 1 linked audio")
     print(f"  Images:      2 embedded PNGs (1 blurry ~27 PPI, 1 oversized ~800 PPI)")
     print(f"  Transitions: fade (slide 2), push+auto (slide 3), dissolve (slide 4)")
     print(f"  Animations:  1 animEffect on slide 4")
