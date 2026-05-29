@@ -46,6 +46,9 @@ IMAGE_EXTENSIONS  = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff',
 SAFE_VIDEO_FORMATS = {'.mp4', '.mov'}  # broadly supported on event systems
 SAFE_AUDIO_FORMATS = {'.mp3', '.wav', '.aac', '.m4a'}
 
+TRANS_WARN_MS = 1500  # transition duration above this is flagged as slow
+ANIM_WARN_MS  = 1500  # animation effect duration above this is flagged as slow
+
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -265,23 +268,68 @@ def slide_transition(slide, n):
     if t is None:
         return None
     children = [c.tag.split('}')[-1] for c in t if '}' in c.tag]
+    raw = t.get('dur')
+    try:
+        dur_ms = int(raw) if raw else None
+    except ValueError:
+        dur_ms = None
     return dict(
         slide=n,
         kind=children[0] if children else 'none',
         click=t.get('advClick', '1') != '0',
         auto_ms=t.get('advTm'),
-        dur_ms=t.get('dur'),
+        dur_ms=dur_ms,        # int ms, or None → PowerPoint default (~700 ms)
     )
 
 
-def slide_animation_count(slide):
-    """Return count of animation effect nodes on a slide (0 = no animations)."""
-    timing = slide.element.find(qn('p:timing'))
+_ANIM_TAGS = [qn(t) for t in
+              ('p:anim', 'p:animEffect', 'p:animMotion', 'p:animScale', 'p:animRot')]
+
+
+def animation_effect_durations(element):
+    """
+    Return a list of per-effect durations (int ms, or None for 'indefinite')
+    for any element that can hold p:timing — slide, master, or layout.
+    """
+    timing = element.find(qn('p:timing'))
     if timing is None:
-        return 0
-    anim_tags = [qn(t) for t in
-                 ('p:anim', 'p:animEffect', 'p:animMotion', 'p:animScale', 'p:animRot')]
-    return sum(len(timing.findall('.//' + tag)) for tag in anim_tags)
+        return []
+
+    durations = []
+    for tag in _ANIM_TAGS:
+        for anim in timing.findall('.//' + tag):
+            cBhvr = anim.find(qn('p:cBhvr'))
+            if cBhvr is None:
+                continue
+            cTn = cBhvr.find(qn('p:cTn'))
+            if cTn is None:
+                continue
+            raw = cTn.get('dur', '')
+            if raw == 'indefinite':
+                durations.append(None)
+            elif raw:
+                try:
+                    durations.append(int(raw))
+                except ValueError:
+                    pass
+    return durations
+
+
+def check_masters_for_animations(prs):
+    """
+    Check the slide master and every slide layout for animation effects.
+    Returns list of (label, durations) for any that have animations.
+    """
+    found = []
+    master = prs.slide_master
+    durs = animation_effect_durations(master.element)
+    if durs:
+        found.append(('Slide master', durs))
+    for layout in master.slide_layouts:
+        durs = animation_effect_durations(layout.element)
+        if durs:
+            found.append((f"Layout '{layout.name or 'unnamed'}'", durs))
+    return found
 
 
 # ── Presentation-level properties ─────────────────────────────────────────────
@@ -496,7 +544,7 @@ def analyze(path, display_wh=(1920, 1080)):
 
     # ── Transitions & animations ───────────────────────────────────────────────
     transitions  = []
-    anim_slides  = []
+    anim_slides  = []   # list of (slide_num, [dur_ms, ...])
     auto_advance = []
 
     for i, slide in enumerate(prs.slides, 1):
@@ -505,23 +553,54 @@ def analyze(path, display_wh=(1920, 1080)):
             transitions.append(t)
             if t['auto_ms']:
                 auto_advance.append(i)
-        count = slide_animation_count(slide)
-        if count > 0:
-            anim_slides.append((i, count))
+        durs = animation_effect_durations(slide.element)
+        if durs:
+            anim_slides.append((i, durs))
+
+    master_anims = check_masters_for_animations(prs)
 
     section_header("TRANSITIONS & ANIMATIONS")
-    print(f"  Slides with transitions    {len(transitions)}/{n_slides}")
+    print(f"  Transitions  ({len(transitions)}/{n_slides} slides)")
     for t in transitions:
-        parts = [f"slide {t['slide']:>2}", f"{t['kind']:<20}"]
-        if t['click']:
-            parts.append("advance on click")
+        dur    = t['dur_ms']
+        slow   = dur is not None and dur > TRANS_WARN_MS
+        d_str  = f"{dur} ms" if dur is not None else "default"
+        s_tag  = f"  ⚠ SLOW (>{TRANS_WARN_MS} ms)" if slow else ""
+        adv    = "click" if t['click'] else "no-click"
         if t['auto_ms']:
-            parts.append(f"auto after {t['auto_ms']} ms")
-        print(f"  {'  '.join(parts)}")
+            adv += f"  auto-advance {t['auto_ms']} ms"
+        print(f"  slide {t['slide']:>2}  {t['kind']:<16}  {d_str:<12}{s_tag}  {adv}")
 
-    print(f"\n  Slides with animations     {len(anim_slides)}/{n_slides}")
-    for slide_n, count in anim_slides:
-        print(f"  slide {slide_n:>2}  {count} animation effect(s)")
+    print(f"\n  Animations  ({len(anim_slides)}/{n_slides} slides)")
+    for slide_n, durs in anim_slides:
+        parts = []
+        has_slow = False
+        has_indefinite = False
+        for d in durs:
+            if d is None:
+                parts.append("∞")
+                has_indefinite = True
+            else:
+                s = f"{d} ms"
+                if d > ANIM_WARN_MS:
+                    s += " ⚠"
+                    has_slow = True
+                parts.append(s)
+        flags = []
+        if has_slow:
+            flags.append(f"⚠ effect(s) > {ANIM_WARN_MS} ms")
+        if has_indefinite:
+            flags.append("⚠ indefinite duration")
+        flag_str = "  " + "  ".join(flags) if flags else ""
+        print(f"  slide {slide_n:>2}  {len(durs)} effect(s)   [{', '.join(parts)}]{flag_str}")
+
+    print(f"\n  Master / layouts")
+    if master_anims:
+        for label, durs in master_anims:
+            print(f"  ⚠  {label}  has {len(durs)} animation(s) — "
+                  f"will play on every slide using this master/layout")
+    else:
+        print(f"  ✓  No animations in slide master or layouts")
 
     if auto_advance:
         print(f"\n  ⚠  Auto-advancing slides: {auto_advance}  — verify timing on event system")
@@ -599,8 +678,36 @@ def analyze(path, display_wh=(1920, 1080)):
     if anim_slides:
         warnings.append(
             f"{len(anim_slides)} slide(s) have animations "
-            f"(slides {[s for s,_ in anim_slides]}) — test playback on event system"
+            f"(slides {[s for s, _ in anim_slides]}) — test playback on event system"
         )
+
+    slow_trans = [t for t in transitions
+                  if t['dur_ms'] is not None and t['dur_ms'] > TRANS_WARN_MS]
+    if slow_trans:
+        details = ', '.join(f"slide {t['slide']} ({t['dur_ms']} ms)" for t in slow_trans)
+        warnings.append(f"Slow transition(s) > {TRANS_WARN_MS} ms: {details}")
+
+    slow_anim_slides = [s for s, durs in anim_slides
+                        if any(d is not None and d > ANIM_WARN_MS for d in durs)]
+    if slow_anim_slides:
+        warnings.append(
+            f"Slow animation effect(s) > {ANIM_WARN_MS} ms on slides {slow_anim_slides}"
+        )
+
+    indef_slides = [s for s, durs in anim_slides if any(d is None for d in durs)]
+    if indef_slides:
+        warnings.append(
+            f"Indefinite-duration animation(s) on slides {indef_slides} — "
+            f"may stall auto-advance"
+        )
+
+    if master_anims:
+        labels = ', '.join(label for label, _ in master_anims)
+        warnings.append(
+            f"Animations in master/layout ({labels}) — "
+            f"will play on every slide using that master/layout"
+        )
+
     if auto_advance:
         warnings.append(f"Auto-advance timing on slides {auto_advance} — verify on event system")
     if ole_files:
