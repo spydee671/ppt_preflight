@@ -977,16 +977,24 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
     master_anims = check_masters_for_animations(prs)
 
     section_header("TRANSITIONS & ANIMATIONS")
-    print(f"  Transitions  ({len(transitions)}/{n_slides} slides)")
-    for t in transitions:
+    real_transitions = [t for t in transitions if t['kind'] != 'none']
+    print(f"  Transitions  ({len(real_transitions)}/{n_slides} slides)")
+    used_default_dur = False
+    for t in real_transitions:
         dur    = t['dur_ms']
         slow   = dur is not None and dur > TRANS_WARN_MS
-        d_str  = fmt_ms(dur) if dur is not None else "default"
+        if dur is not None:
+            d_str = fmt_ms(dur)
+        else:
+            d_str = "~0.7s *"
+            used_default_dur = True
         s_tag  = f"  ⚠ SLOW (>{fmt_ms(TRANS_WARN_MS)})" if slow else ""
         adv    = "click" if t['click'] else "no-click"
         if t['auto_ms']:
             adv += f"  auto-advance {fmt_ms(int(t['auto_ms']))}"
-        print(f"  slide {t['slide']:>2}  {t['kind']:<16}  {d_str:<12}{s_tag}  {adv}")
+        print(f"  slide {t['slide']:>3}  {t['kind']:<16}  {d_str:<12}{s_tag}  {adv}")
+    if used_default_dur:
+        print(f"  * duration not set — PowerPoint will use its built-in default (~0.7 s)")
 
     print(f"\n  Animations  ({len(anim_slides)}/{n_slides} slides)")
     for slide_n, durs in anim_slides:
