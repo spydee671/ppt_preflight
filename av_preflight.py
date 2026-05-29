@@ -52,6 +52,11 @@ ANIM_WARN_MS  = 1500  # animation effect duration above this is flagged as slow
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
+def fmt_ms(ms):
+    """Format milliseconds as a seconds string: 700 → '0.7s', 2500 → '2.5s'."""
+    return f"{int(ms) / 1000:.1f}s"
+
+
 def fmt_size(n):
     if n is None:
         return "?"
@@ -564,11 +569,11 @@ def analyze(path, display_wh=(1920, 1080)):
     for t in transitions:
         dur    = t['dur_ms']
         slow   = dur is not None and dur > TRANS_WARN_MS
-        d_str  = f"{dur} ms" if dur is not None else "default"
-        s_tag  = f"  ⚠ SLOW (>{TRANS_WARN_MS} ms)" if slow else ""
+        d_str  = fmt_ms(dur) if dur is not None else "default"
+        s_tag  = f"  ⚠ SLOW (>{fmt_ms(TRANS_WARN_MS)})" if slow else ""
         adv    = "click" if t['click'] else "no-click"
         if t['auto_ms']:
-            adv += f"  auto-advance {t['auto_ms']} ms"
+            adv += f"  auto-advance {fmt_ms(int(t['auto_ms']))}"
         print(f"  slide {t['slide']:>2}  {t['kind']:<16}  {d_str:<12}{s_tag}  {adv}")
 
     print(f"\n  Animations  ({len(anim_slides)}/{n_slides} slides)")
@@ -581,14 +586,14 @@ def analyze(path, display_wh=(1920, 1080)):
                 parts.append("∞")
                 has_indefinite = True
             else:
-                s = f"{d} ms"
+                s = fmt_ms(d)
                 if d > ANIM_WARN_MS:
                     s += " ⚠"
                     has_slow = True
                 parts.append(s)
         flags = []
         if has_slow:
-            flags.append(f"⚠ effect(s) > {ANIM_WARN_MS} ms")
+            flags.append(f"⚠ effect(s) > {fmt_ms(ANIM_WARN_MS)}")
         if has_indefinite:
             flags.append("⚠ indefinite duration")
         flag_str = "  " + "  ".join(flags) if flags else ""
@@ -684,14 +689,14 @@ def analyze(path, display_wh=(1920, 1080)):
     slow_trans = [t for t in transitions
                   if t['dur_ms'] is not None and t['dur_ms'] > TRANS_WARN_MS]
     if slow_trans:
-        details = ', '.join(f"slide {t['slide']} ({t['dur_ms']} ms)" for t in slow_trans)
-        warnings.append(f"Slow transition(s) > {TRANS_WARN_MS} ms: {details}")
+        details = ', '.join(f"slide {t['slide']} ({fmt_ms(t['dur_ms'])})" for t in slow_trans)
+        warnings.append(f"Slow transition(s) > {fmt_ms(TRANS_WARN_MS)}: {details}")
 
     slow_anim_slides = [s for s, durs in anim_slides
                         if any(d is not None and d > ANIM_WARN_MS for d in durs)]
     if slow_anim_slides:
         warnings.append(
-            f"Slow animation effect(s) > {ANIM_WARN_MS} ms on slides {slow_anim_slides}"
+            f"Slow animation effect(s) > {fmt_ms(ANIM_WARN_MS)} on slides {slow_anim_slides}"
         )
 
     indef_slides = [s for s, durs in anim_slides if any(d is None for d in durs)]
