@@ -843,12 +843,13 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
         print(f"  {'Slide':>5}  {'File':<30}  {'Source':<9}  "
               f"{'Autoplay':<8}  {'Loop':<5}  {'Mute':<5}  Size")
         print(f"  {'─'*5}  {'─'*30}  {'─'*9}  {'─'*8}  {'─'*5}  {'─'*5}  {'─'*10}")
+        has_unknown = any(v['autoplay'] is None for v in all_videos)
         for v in all_videos:
             source   = "embedded" if v['embedded'] else "linked ⚠"
-            ap_str   = ("—"     if v['autoplay'] is None
+            ap_str   = ("? ⚠"   if v['autoplay'] is None
                         else "YES" if v['autoplay'] else "NO ⚠")
-            loop_str = "—" if v['loop']  is None else ("yes" if v['loop']  else "no")
-            mute_str = "—" if v['muted'] is None else ("yes" if v['muted'] else "no")
+            loop_str = "?"   if v['loop']  is None else ("yes" if v['loop']  else "no")
+            mute_str = "?"   if v['muted'] is None else ("yes" if v['muted'] else "no")
             sz_str   = fmt_size(v['size']) if v['size'] else "—"
             codec_w  = "  ⚠ codec?" if v['ext'] not in SAFE_VIDEO_FORMATS else ""
             print(f"  {v['slide']:>5}  {v['name']:<30}  {source:<9}  "
@@ -859,6 +860,9 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
         if no_autoplay_v:
             print(f"\n  ⚠  {len(no_autoplay_v)} video(s) not set to autoplay — "
                   f"will require a manual click or trigger to start")
+        if has_unknown:
+            print(f"  ⚠  '?' = playback settings unreadable (older embed format) — "
+                  f"verify autoplay/loop/mute manually in PowerPoint")
 
     # ── AUDIO ──────────────────────────────────────────────────────────────────
     def print_audio_section(items):
@@ -1109,9 +1113,10 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
         )
     unknown_ap_vids = [v for v in all_videos if v.get('autoplay') is None]
     if unknown_ap_vids:
+        names = ', '.join(v['name'] for v in unknown_ap_vids)
         warnings.append(
-            f"{len(unknown_ap_vids)} video(s) with no playback shape detected — "
-            f"verify autoplay/loop/mute settings on event system"
+            f"{len(unknown_ap_vids)} video(s) with unreadable playback settings "
+            f"(older embed format — check autoplay/loop/mute manually): {names}"
         )
 
     if not embedded_font_files and fonts:
