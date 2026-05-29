@@ -21,7 +21,7 @@ import argparse
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 try:
     from pptx import Presentation
@@ -91,6 +91,39 @@ def aspect_match(deck_w_emu, deck_h_emu, disp_w, disp_h, tol=0.02):
     return abs(deck_r - disp_r) < tol, deck_r, disp_r
 
 
+def fmt_slide_list(slide_nums, show_count=True):
+    """
+    Format a list of slide numbers with run-length range compression.
+
+      [1, 2, 3, 5, 7, 8, 9]  →  "[1–3, 5, 7–9]"
+      [8, 11, 13, 14, 48, …, 103]  →  "[8, 11, 13–14, 48–103]  (60 slides)"
+
+    A count in parentheses is appended when > 8 items, unless show_count=False
+    (use False when the count is already stated in the surrounding text).
+    """
+    if not slide_nums:
+        return "—"
+    nums = sorted(int(n) for n in slide_nums)
+    n    = len(nums)
+
+    # Build consecutive runs
+    runs = []
+    s = e = nums[0]
+    for v in nums[1:]:
+        if v == e + 1:
+            e = v
+        else:
+            runs.append((s, e))
+            s = e = v
+    runs.append((s, e))
+
+    parts = [f"{s}–{e}" if e > s else str(s) for s, e in runs]
+    result = "[" + ", ".join(parts) + "]"
+    if n > 8 and show_count:
+        result += f"  ({n} slides)"
+    return result
+
+
 def section_header(title):
     print(f"\n{title}")
     print("─" * 60)
@@ -105,7 +138,7 @@ def collect_fonts(element, slide_num, bucket):
     separately via theme_font_names().
     """
     for latin in element.iter(qn('a:latin')):
-        tf = latin.get('typeface', '')
+        tf = latin.get('typeface', '').strip()
         if tf and not tf.startswith('+'):
             bucket[tf].add(slide_num)
 
@@ -520,7 +553,7 @@ def analyze(path, display_wh=(1920, 1080)):
 
     section_header("DECK OVERVIEW")
     print(f"  Slides          {n_slides}" +
-          (f"  ({len(hidden_slides)} hidden: slides {hidden_slides})" if hidden_slides else ""))
+          (f"  ({len(hidden_slides)} hidden: {fmt_slide_list(hidden_slides, show_count=False)})" if hidden_slides else ""))
     print(f"  Dimensions      {w_in:.2f}\" × {h_in:.2f}\"  "
           f"({w_px} × {h_px} px @ 96 dpi)")
     print(f"  Aspect ratio    {aspect_label(w_emu, h_emu)}")
@@ -568,7 +601,7 @@ def analyze(path, display_wh=(1920, 1080)):
         if name == theme_fonts.get('minorFont'):
             tags.append("theme body")
         tag_str = f"  [{', '.join(tags)}]" if tags else ""
-        print(f"  {name:<40} slides {on_slides}{tag_str}")
+        print(f"  {name:<40} slides {fmt_slide_list(on_slides)}{tag_str}")
 
     if theme_fonts:
         print(f"\n  Theme heading font  {theme_fonts.get('majorFont', '?')}")
@@ -762,26 +795,31 @@ def analyze(path, display_wh=(1920, 1080)):
 
     print(f"\n  Animations  ({len(anim_slides)}/{n_slides} slides)")
     for slide_n, durs in anim_slides:
-        parts = []
-        has_slow = False
-        has_indefinite = False
-        for d in durs:
+        has_slow       = any(d is not None and d > ANIM_WARN_MS for d in durs)
+        has_indefinite = any(d is None for d in durs)
+
+        # Grouped summary: "19×2.0s ⚠  15×0.2s  1×1.0s"
+        counts = Counter(durs)
+        # Sort: None last, then by duration descending (longest / slowest first)
+        sorted_keys = sorted(counts, key=lambda x: (x is None, -(x or 0)))
+        dur_parts = []
+        for d in sorted_keys:
+            c = counts[d]
             if d is None:
-                parts.append("∞")
-                has_indefinite = True
+                dur_parts.append(f"{c}×∞")
             else:
-                s = fmt_ms(d)
-                if d > ANIM_WARN_MS:
-                    s += " ⚠"
-                    has_slow = True
-                parts.append(s)
+                flag = " ⚠" if d > ANIM_WARN_MS else ""
+                dur_parts.append(f"{c}×{fmt_ms(d)}{flag}")
+
         flags = []
         if has_slow:
             flags.append(f"⚠ effect(s) > {fmt_ms(ANIM_WARN_MS)}")
         if has_indefinite:
             flags.append("⚠ indefinite duration")
         flag_str = "  " + "  ".join(flags) if flags else ""
-        print(f"  slide {slide_n:>2}  {len(durs)} effect(s)   [{', '.join(parts)}]{flag_str}")
+
+        print(f"  slide {slide_n:>3}  {len(durs):>3} effect(s)   "
+              f"{'  '.join(dur_parts)}{flag_str}")
 
     print(f"\n  Master / layouts")
     if master_anims:
@@ -792,7 +830,7 @@ def analyze(path, display_wh=(1920, 1080)):
         print(f"  ✓  No animations in slide master or layouts")
 
     if auto_advance:
-        print(f"\n  ⚠  Auto-advancing slides: {auto_advance}  — verify timing on event system")
+        print(f"\n  ⚠  Auto-advancing slides: {fmt_slide_list(auto_advance)}  — verify timing on event system")
 
     # ── Speaker notes ──────────────────────────────────────────────────────────
     notes_slides = [
@@ -801,7 +839,7 @@ def analyze(path, display_wh=(1920, 1080)):
     ]
     section_header("SPEAKER NOTES")
     print(f"  {len(notes_slides)}/{n_slides} slides have notes" +
-          (f"  (slides {notes_slides})" if notes_slides else ""))
+          (f"  {fmt_slide_list(notes_slides, show_count=False)}" if notes_slides else ""))
 
     # ── Hyperlinks ─────────────────────────────────────────────────────────────
     links = []
@@ -881,7 +919,7 @@ def analyze(path, display_wh=(1920, 1080)):
     if anim_slides:
         warnings.append(
             f"{len(anim_slides)} slide(s) have animations "
-            f"(slides {[s for s, _ in anim_slides]}) — test playback on event system"
+            f"{fmt_slide_list([s for s, _ in anim_slides], show_count=False)} — test playback on event system"
         )
 
     slow_trans = [t for t in transitions
@@ -894,13 +932,14 @@ def analyze(path, display_wh=(1920, 1080)):
                         if any(d is not None and d > ANIM_WARN_MS for d in durs)]
     if slow_anim_slides:
         warnings.append(
-            f"Slow animation effect(s) > {fmt_ms(ANIM_WARN_MS)} on slides {slow_anim_slides}"
+            f"Slow animation effect(s) > {fmt_ms(ANIM_WARN_MS)} on slides "
+            f"{fmt_slide_list(slow_anim_slides)}"
         )
 
     indef_slides = [s for s, durs in anim_slides if any(d is None for d in durs)]
     if indef_slides:
         warnings.append(
-            f"Indefinite-duration animation(s) on slides {indef_slides} — "
+            f"Indefinite-duration animation(s) on slides {fmt_slide_list(indef_slides)} — "
             f"may stall auto-advance"
         )
 
@@ -912,11 +951,11 @@ def analyze(path, display_wh=(1920, 1080)):
         )
 
     if auto_advance:
-        warnings.append(f"Auto-advance timing on slides {auto_advance} — verify on event system")
+        warnings.append(f"Auto-advance timing on slides {fmt_slide_list(auto_advance)} — verify on event system")
     if ole_files:
         warnings.append(f"{len(ole_files)} OLE embedded object(s) — requires matching software to render")
     if hidden_slides:
-        warnings.append(f"{len(hidden_slides)} hidden slide(s): {hidden_slides}")
+        warnings.append(f"{len(hidden_slides)} hidden slide(s): {fmt_slide_list(hidden_slides, show_count=False)}")
     if show_props['mode'] == 'kiosk (auto-advance, no menu)':
         warnings.append("Kiosk mode — presenter cannot skip slides manually")
 
@@ -938,7 +977,7 @@ def analyze(path, display_wh=(1920, 1080)):
     if blurry_imgs:
         warnings.append(
             f"{len(blurry_imgs)} low-resolution image(s) on "
-            f"slides {[i['slide'] for i in blurry_imgs]} — may appear blurry on screen"
+            f"slides {fmt_slide_list([i['slide'] for i in blurry_imgs])} — may appear blurry on screen"
         )
 
     if not ratio_ok:
