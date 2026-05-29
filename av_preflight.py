@@ -18,6 +18,7 @@ Requires:
 """
 
 import argparse
+import json
 import os
 import shutil
 import struct
@@ -624,65 +625,140 @@ def _get_ffprobe():
     return _ffprobe_exe or None
 
 
-def _ffprobe_codec(rel, zf, ext: str):
-    """Extract video to a temp file and run ffprobe. Returns codec label or None."""
+_HDR_TRANSFERS = {'smpte2084', 'arib-std-b67', 'smpte428'}   # PQ, HLG, DCI-P3
+_AUDIO_CH_NAMES = {1: 'mono', 2: 'stereo', 6: '5.1', 8: '7.1'}
+
+_EMPTY_INFO = dict(
+    codec=None, width=None, height=None, fps=None, duration_s=None,
+    interlaced=False, hdr=False,
+    audio_codec=None, audio_channels=None,  # None = unknown; False = no audio track
+)
+
+
+def _ffprobe_info(rel, zf, ext: str):
+    """Extract video to a temp file, run ffprobe, return full metadata dict."""
     fp = _get_ffprobe()
     if not fp:
         return None
     try:
         zip_path = str(rel.target_part.partname).lstrip('/')
-        suffix = ext if ext.startswith('.') else f'.{ext}'
+        suffix   = ext if ext.startswith('.') else f'.{ext}'
         fd, tmp_path = tempfile.mkstemp(suffix=suffix)
         try:
             with os.fdopen(fd, 'wb') as fout:
                 fout.write(zf.read(zip_path))
-            result = subprocess.run(
+            proc = subprocess.run(
                 [fp, '-v', 'error',
-                 '-select_streams', 'v:0',
-                 '-show_entries', 'stream=codec_name',
-                 '-of', 'default=noprint_wrappers=1:nokey=1',
-                 tmp_path],
+                 '-show_streams', '-show_format',
+                 '-of', 'json', tmp_path],
                 capture_output=True, text=True, timeout=120,
             )
-            codec_raw = result.stdout.strip().lower()
-            if codec_raw:
-                return _FFPROBE_CODEC_MAP.get(codec_raw, codec_raw.upper())
+            if proc.returncode != 0:
+                return None
+            data = json.loads(proc.stdout)
         finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+        info = dict(_EMPTY_INFO)  # copy defaults
+        has_audio = False
+
+        for stream in data.get('streams', []):
+            stype = stream.get('codec_type')
+
+            if stype == 'video' and info['codec'] is None:
+                raw = stream.get('codec_name', '').lower()
+                info['codec']  = _FFPROBE_CODEC_MAP.get(raw, raw.upper() or None)
+                info['width']  = stream.get('width')
+                info['height'] = stream.get('height')
+                # Frame rate: stored as "num/den" fraction
+                rfr = stream.get('r_frame_rate', '')
+                if '/' in rfr:
+                    try:
+                        n, d = rfr.split('/')
+                        info['fps'] = int(n) / int(d)
+                    except (ValueError, ZeroDivisionError):
+                        pass
+                # Interlaced
+                fo = stream.get('field_order', '')
+                info['interlaced'] = fo not in ('', 'progressive', 'unknown')
+                # HDR
+                info['hdr'] = stream.get('color_transfer', '') in _HDR_TRANSFERS
+
+            elif stype == 'audio' and not has_audio:
+                has_audio = True
+                raw_ac = stream.get('codec_name', '').lower()
+                info['audio_codec']    = _FFPROBE_CODEC_MAP.get(raw_ac, raw_ac.upper() or None)
+                info['audio_channels'] = stream.get('channels')
+
+        if not has_audio:
+            info['audio_codec'] = False   # confirmed no audio track
+
+        fmt = data.get('format', {})
+        try:
+            info['duration_s'] = float(fmt['duration'])
+        except (KeyError, ValueError, TypeError):
+            pass
+
+        return info
     except Exception:
         pass
     return None
 
 
-def _video_codec(rel, zf, ext: str):
-    """Detect codec for an embedded video. Returns a label string or None."""
-    try:
-        if ext in ('.mp4', '.mov', '.m4v'):
-            # Fast path: custom ISOBMFF parser on first 256 KB (handles fast-start files)
+def _fmt_fps(fps):
+    """Format a float fps value cleanly: 29.97, 30, 23.98 …"""
+    if fps is None:
+        return None
+    common = {23.976: '23.98', 29.97: '29.97', 59.94: '59.94', 119.88: '119.88'}
+    for ref, label in common.items():
+        if abs(fps - ref) < 0.01:
+            return label
+    return f'{fps:.0f}' if fps == int(fps) else f'{fps:.2f}'.rstrip('0').rstrip('.')
+
+
+def _fmt_duration(seconds):
+    """Format seconds as M:SS or H:MM:SS."""
+    if seconds is None:
+        return None
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f'{h}:{m:02}:{sec:02}' if h else f'{m}:{sec:02}'
+
+
+def _video_info(rel, zf, ext: str) -> dict:
+    """Return a metadata dict for an embedded video (codec + technical details)."""
+    info = dict(_EMPTY_INFO)
+
+    # Container-type fallbacks (used when ffprobe is unavailable)
+    if ext == '.wmv':
+        info['codec'] = 'WMV'
+    elif ext == '.avi':
+        info['codec'] = 'AVI'
+    elif ext in ('.mkv', '.webm'):
+        info['codec'] = 'WebM/MKV'
+
+    # Fast custom parser for codec on MP4/MOV (no temp file, instant)
+    if ext in ('.mp4', '.mov', '.m4v'):
+        try:
             zip_path = str(rel.target_part.partname).lstrip('/')
             with zf.open(zip_path) as f:
                 data = f.read(_CODEC_PROBE_BYTES)
-            result = _probe_mp4_codec(data)
-            if result is not None:
-                return result
-            # moov not in first 256 KB (non-fast-start) — fall through to ffprobe
-        # ffprobe handles all formats and moov-at-end files
-        fp_result = _ffprobe_codec(rel, zf, ext)
-        if fp_result:
-            return fp_result
-        # Container-type fallback when ffprobe is unavailable
-        if ext == '.wmv':
-            return 'WMV'
-        if ext == '.avi':
-            return 'AVI'
-        if ext in ('.mkv', '.webm'):
-            return 'WebM/MKV'
-    except Exception:
-        pass
-    return None
+            fast = _probe_mp4_codec(data)
+            if fast:
+                info['codec'] = fast
+        except Exception:
+            pass
+
+    # ffprobe: full metadata, overrides codec if already set
+    ff = _ffprobe_info(rel, zf, ext)
+    if ff:
+        info.update(ff)
+
+    return info
 
 
 def find_video_shapes(slide, slide_num, zf):
@@ -721,7 +797,7 @@ def find_video_shapes(slide, slide_num, zf):
                 continue
             name  = PurePosixPath(target).name
             size  = _embedded_size(rel, zf) if embedded else None
-            codec = _video_codec(rel, zf, ext) if embedded else None
+            vinfo = _video_info(rel, zf, ext) if embedded else dict(_EMPTY_INFO)
         except Exception:
             continue
 
@@ -735,11 +811,11 @@ def find_video_shapes(slide, slide_num, zf):
             embedded    = embedded,
             linked_path = target if not embedded else None,
             size        = size,
-            codec       = codec,
             autoplay    = props['autoplay'] if props else None,
             loop        = props['loop']     if props else None,
             muted       = props['muted']    if props else None,
             _target     = target,            # internal — stripped in analyze()
+            **vinfo,
         ))
 
     return results
@@ -1005,6 +1081,7 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
             elif ('video' in rt or ext in VIDEO_EXTENSIONS) and target not in shape_targets:
                 # Video rel with no matching shape (legacy deck or bare relationship)
                 embedded = not rel.is_external
+                vinfo    = _video_info(rel, zf, ext) if embedded else dict(_EMPTY_INFO)
                 all_videos.append(dict(
                     slide       = i,
                     kind        = 'video',
@@ -1013,10 +1090,10 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
                     embedded    = embedded,
                     linked_path = target if rel.is_external else None,
                     size        = _embedded_size(rel, zf) if embedded else None,
-                    codec       = _video_codec(rel, zf, ext) if embedded else None,
                     autoplay    = None,
                     loop        = None,
                     muted       = None,
+                    **vinfo,
                 ))
 
         all_images.extend(slide_images(slide, i, zf))
@@ -1046,6 +1123,7 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
         print(f"  {'─'*5}  {'─'*30}  {'─'*9}  {'─'*14}"
               f"  {'─'*8}  {'─'*5}  {'─'*5}  {'─'*10}")
         has_unknown = any(v['autoplay'] is None for v in all_videos)
+        deck_w, deck_h = display_wh  # use deck native res for comparison
         for v in all_videos:
             source   = "embedded" if v['embedded'] else "linked ⚠"
             ap_str   = ("? ⚠"   if v['autoplay'] is None
@@ -1064,6 +1142,33 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
                   f"  {ap_str:<8}  {loop_str:<5}  {mute_str:<5}  {sz_str}")
             if v.get('linked_path'):
                 print(f"         ↳ {v['linked_path']}")
+            # Detail line: resolution, fps, duration, audio — only when known
+            detail_parts = []
+            if v.get('width') and v.get('height'):
+                res = f"{v['width']}×{v['height']}"
+                # Flag if video resolution exceeds the target display
+                if v['width'] > deck_w or v['height'] > deck_h:
+                    res += f" ⚠ (display is {deck_w}×{deck_h})"
+                detail_parts.append(res)
+            fps_str = _fmt_fps(v.get('fps'))
+            if fps_str:
+                detail_parts.append(f"{fps_str} fps")
+            dur_str = _fmt_duration(v.get('duration_s'))
+            if dur_str:
+                detail_parts.append(dur_str)
+            ac = v.get('audio_codec')
+            if ac is False:
+                detail_parts.append("no audio ⚠")
+            elif ac:
+                ch = v.get('audio_channels')
+                ch_str = _AUDIO_CH_NAMES.get(ch, f'{ch}ch') if ch else ''
+                detail_parts.append(f"{ac} {ch_str}".strip())
+            if v.get('interlaced'):
+                detail_parts.append("interlaced ⚠")
+            if v.get('hdr'):
+                detail_parts.append("HDR ⚠")
+            if detail_parts:
+                print(f"         ↳ {'  '.join(detail_parts)}")
         no_autoplay_v = [v for v in all_videos if v['autoplay'] is False]
         if no_autoplay_v:
             print(f"\n  ⚠  {len(no_autoplay_v)} video(s) not set to autoplay — "
@@ -1344,6 +1449,38 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
         warnings.append(
             f"{len(unknown_ap_vids)} video(s) with unreadable playback settings on slides "
             f"{_slide_list(unknown_ap_vids)} — verify autoplay/loop/mute manually in PowerPoint"
+        )
+
+    interlaced_vids = [v for v in all_videos if v.get('interlaced')]
+    if interlaced_vids:
+        warnings.append(
+            f"{len(interlaced_vids)} interlaced video(s) on slides {_slide_list(interlaced_vids)} — "
+            f"may cause visual artifacts on modern displays; consider deinterlacing"
+        )
+
+    hdr_vids = [v for v in all_videos if v.get('hdr')]
+    if hdr_vids:
+        warnings.append(
+            f"{len(hdr_vids)} HDR video(s) on slides {_slide_list(hdr_vids)} — "
+            f"will not display correctly on a standard SDR event display"
+        )
+
+    no_audio_vids = [v for v in all_videos if v.get('audio_codec') is False]
+    if no_audio_vids:
+        warnings.append(
+            f"{len(no_audio_vids)} video(s) have no audio track on slides "
+            f"{_slide_list(no_audio_vids)} — confirm this is intentional"
+        )
+
+    oversized_vids = [v for v in all_videos
+                      if (v.get('width') or 0) > display_wh[0]
+                      or (v.get('height') or 0) > display_wh[1]]
+    if oversized_vids:
+        biggest = max(oversized_vids, key=lambda v: (v.get('width') or 0) * (v.get('height') or 0))
+        warnings.append(
+            f"{len(oversized_vids)} video(s) exceed target display resolution "
+            f"({display_wh[0]}×{display_wh[1]}) on slides {_slide_list(oversized_vids)} — "
+            f"largest is {biggest.get('width')}×{biggest.get('height')} (slide {biggest['slide']})"
         )
 
     if not embedded_font_files and fonts:
