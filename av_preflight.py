@@ -1084,39 +1084,45 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
     linked_v = [v for v in all_videos if not v['embedded']]
     linked_a = [v for v in all_audios if not v['embedded']]
 
+    def _slide_list(items, key='slide'):
+        return fmt_slide_list(sorted({v[key] for v in items}), show_count=False)
+
     if linked_v:
         issues.append(
-            f"{len(linked_v)} linked video(s) — will break on a different machine: "
-            f"{', '.join(v['name'] for v in linked_v)}"
+            f"{len(linked_v)} linked video(s) on slides {_slide_list(linked_v)} — "
+            f"will break on a different machine"
         )
     if linked_a:
         issues.append(
-            f"{len(linked_a)} linked audio file(s) — will break on a different machine: "
-            f"{', '.join(v['name'] for v in linked_a)}"
+            f"{len(linked_a)} linked audio file(s) on slides {_slide_list(linked_a)} — "
+            f"will break on a different machine"
         )
     if linked_imgs:
+        img_slides = sorted({s for img in linked_imgs for s in img['slides']})
         issues.append(
-            f"{len(linked_imgs)} linked image(s) — may not display on a different machine"
+            f"{len(linked_imgs)} linked image(s) on slides {fmt_slide_list(img_slides, show_count=False)} — "
+            f"will not display on a different machine"
         )
 
     unsafe_vid = [v for v in all_videos if v['embedded'] and v['ext'] not in SAFE_VIDEO_FORMATS]
     if unsafe_vid:
-        fmts = ', '.join(set(v['ext'] for v in unsafe_vid))
-        warnings.append(f"Video format(s) {fmts} may need a codec — prefer .mp4/.mov")
+        fmts = ', '.join(sorted(set(v['ext'] for v in unsafe_vid)))
+        warnings.append(
+            f"Video format(s) {fmts} on slides {_slide_list(unsafe_vid)} — "
+            f"may need a codec; prefer .mp4/.mov"
+        )
 
     no_autoplay_vids = [v for v in all_videos if v.get('autoplay') is False]
     if no_autoplay_vids:
         warnings.append(
-            f"{len(no_autoplay_vids)} video(s) not set to autoplay — "
-            f"require manual click to start: "
-            f"{', '.join(v['name'] for v in no_autoplay_vids)}"
+            f"{len(no_autoplay_vids)} video(s) not set to autoplay on slides "
+            f"{_slide_list(no_autoplay_vids)} — require manual click to start"
         )
     unknown_ap_vids = [v for v in all_videos if v.get('autoplay') is None]
     if unknown_ap_vids:
-        names = ', '.join(v['name'] for v in unknown_ap_vids)
         warnings.append(
-            f"{len(unknown_ap_vids)} video(s) with unreadable playback settings "
-            f"(older embed format — check autoplay/loop/mute manually): {names}"
+            f"{len(unknown_ap_vids)} video(s) with unreadable playback settings on slides "
+            f"{_slide_list(unknown_ap_vids)} — verify autoplay/loop/mute manually in PowerPoint"
         )
 
     if not embedded_font_files and fonts:
@@ -1128,13 +1134,16 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
     if anim_slides:
         warnings.append(
             f"{len(anim_slides)} slide(s) have animations "
-            f"{fmt_slide_list([s for s, _ in anim_slides], show_count=False)} — test playback on event system"
+            f"{fmt_slide_list([s for s, _ in anim_slides], show_count=False)} — "
+            f"test playback on event system"
         )
 
     slow_trans = [t for t in transitions
                   if t['dur_ms'] is not None and t['dur_ms'] > TRANS_WARN_MS]
     if slow_trans:
-        details = ', '.join(f"slide {t['slide']} ({fmt_ms(t['dur_ms'])})" for t in slow_trans)
+        details = ', '.join(
+            f"slide {t['slide']} ({fmt_ms(t['dur_ms'])})" for t in slow_trans
+        )
         warnings.append(f"Slow transition(s) > {fmt_ms(TRANS_WARN_MS)}: {details}")
 
     slow_anim_slides = [s for s, durs in anim_slides
@@ -1160,33 +1169,48 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
         )
 
     if auto_advance:
-        warnings.append(f"Auto-advance timing on slides {fmt_slide_list(auto_advance)} — verify on event system")
+        warnings.append(
+            f"Auto-advance timing on slides {fmt_slide_list(auto_advance)} — "
+            f"verify on event system"
+        )
     if ole_files:
-        warnings.append(f"{len(ole_files)} OLE embedded object(s) — requires matching software to render")
+        warnings.append(
+            f"{len(ole_files)} OLE embedded object(s) — "
+            f"requires matching software (Excel, etc.) to render"
+        )
     if hidden_slides:
-        warnings.append(f"{len(hidden_slides)} hidden slide(s): {fmt_slide_list(hidden_slides, show_count=False)}")
+        warnings.append(
+            f"{len(hidden_slides)} hidden slide(s): "
+            f"{fmt_slide_list(hidden_slides, show_count=False)}"
+        )
     if show_props['mode'] == 'kiosk (auto-advance, no menu)':
         warnings.append("Kiosk mode — presenter cannot skip slides manually")
 
     ext_links = [l for l in links if l[2]]
     if ext_links:
+        ext_slides = fmt_slide_list(sorted({l[0] for l in ext_links}), show_count=False)
         warnings.append(
-            f"{len(ext_links)} external hyperlink(s) — confirm internet access on event system"
+            f"{len(ext_links)} external hyperlink(s) on slides {ext_slides} — "
+            f"confirm internet access on event system"
         )
 
     oversized_imgs = [i for i in (ppi_issues or []) if i['too_high']]
     blurry_imgs    = [i for i in (ppi_issues or []) if i['too_low']]
     if oversized_imgs:
-        worst = max(oversized_imgs, key=lambda i: i['oversize_x'] or 0)
+        worst      = max(oversized_imgs, key=lambda i: i['oversize_x'] or 0)
+        over_slides = fmt_slide_list(
+            sorted({i['slide'] for i in oversized_imgs}), show_count=False
+        )
         warnings.append(
-            f"{len(oversized_imgs)} oversized image(s) — largest is {worst['oversize_x']}× "
-            f"the needed resolution ({worst['name']}, slide {worst['slide']}) — "
+            f"{len(oversized_imgs)} oversized image(s) on slides {over_slides} — "
+            f"largest {worst['oversize_x']}× over (slide {worst['slide']}) — "
             f"downsample to reduce file size"
         )
     if blurry_imgs:
         warnings.append(
-            f"{len(blurry_imgs)} low-resolution image(s) on "
-            f"slides {fmt_slide_list([i['slide'] for i in blurry_imgs])} — may appear blurry on screen"
+            f"{len(blurry_imgs)} blurry image(s) on slides "
+            f"{fmt_slide_list(sorted({i['slide'] for i in blurry_imgs}), show_count=False)} — "
+            f"may appear low-resolution on screen"
         )
 
     if not ratio_ok:
