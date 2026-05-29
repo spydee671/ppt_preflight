@@ -648,7 +648,7 @@ def presentation_sections(prs):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def analyze(path, display_wh=(1920, 1080)):
+def analyze(path, display_wh=(1920, 1080), verbose=False):
     path = Path(path)
     if not path.exists():
         print(f"File not found: {path}")
@@ -820,6 +820,21 @@ def analyze(path, display_wh=(1920, 1080)):
 
         all_images.extend(slide_images(slide, i, zf))
 
+    # Post-collection dedup: same slide+name can arrive from both the shape scan
+    # AND the legacy 'video' rel (if target_ref strings differ between rel types).
+    # Keep the entry that has playback data (autoplay is not None) over the one
+    # that is all-None; otherwise keep first seen.
+    _seen_vids = {}
+    _deduped   = []
+    for v in all_videos:
+        key = (v['slide'], v['name'])
+        if key not in _seen_vids:
+            _seen_vids[key] = len(_deduped)
+            _deduped.append(v)
+        elif v['autoplay'] is not None and _deduped[_seen_vids[key]]['autoplay'] is None:
+            _deduped[_seen_vids[key]] = v   # upgrade to the one with playback props
+    all_videos = _deduped
+
     # ── VIDEO section — chart-style table ──────────────────────────────────────
     section_header(f"VIDEO  ({len(all_videos)})")
     if not all_videos:
@@ -903,24 +918,46 @@ def analyze(path, display_wh=(1920, 1080)):
     elif not ppi_issues:
         print(f"  ✓  {ppi_checked} image(s) checked — all within range")
     else:
-        ok_count = ppi_checked - len(ppi_issues)
-        for issue in ppi_issues:
-            dim_str  = f"{issue['img_w']}×{issue['img_h']} px"
-            size_str = f"{issue['w_in']}\"×{issue['h_in']}\""
-            if issue['too_high']:
-                # Show pixel-count ratio (area) so the waste is viscerally clear
-                pixel_ratio = round((issue['img_w'] * issue['img_h']) /
-                                    (issue['ideal_w'] * issue['ideal_h']))
-                flag = (f"⚠ {issue['oversize_x']}× oversized "
-                        f"(~{pixel_ratio}× more pixels than needed — "
-                        f"reduce to ~{issue['ideal_w']}×{issue['ideal_h']} px, "
-                        f"save ~{fmt_size(issue['file_size'] - issue['file_size'] // pixel_ratio)})")
-            else:
-                flag = f"⚠ may appear blurry  (min {_PPI_LOW} PPI for standard displays)"
-            print(f"  slide {issue['slide']:>2}  {issue['name']:<26}  "
-                  f"{dim_str:<16}  {size_str:<12}  {issue['ppi']:>4} PPI  {flag}")
-        print(f"\n  {ppi_checked} image(s) checked — "
-              f"{len(ppi_issues)} issue(s), {ok_count} ok")
+        ok_count      = ppi_checked - len(ppi_issues)
+        oversized     = [i for i in ppi_issues if i['too_high']]
+        blurry        = [i for i in ppi_issues if i['too_low']]
+
+        if verbose:
+            # ── Full per-image table ──────────────────────────────────────────
+            for issue in ppi_issues:
+                dim_str  = f"{issue['img_w']}×{issue['img_h']} px"
+                size_str = f"{issue['w_in']}\"×{issue['h_in']}\""
+                if issue['too_high']:
+                    pixel_ratio = round((issue['img_w'] * issue['img_h']) /
+                                        (issue['ideal_w'] * issue['ideal_h']))
+                    flag = (f"⚠ {issue['oversize_x']}× oversized "
+                            f"(~{pixel_ratio}× more pixels than needed — "
+                            f"reduce to ~{issue['ideal_w']}×{issue['ideal_h']} px, "
+                            f"save ~{fmt_size(issue['file_size'] - issue['file_size'] // pixel_ratio)})")
+                else:
+                    flag = f"⚠ may appear blurry  (min {_PPI_LOW} PPI for standard displays)"
+                print(f"  slide {issue['slide']:>3}  {issue['name']:<26}  "
+                      f"{dim_str:<16}  {size_str:<12}  {issue['ppi']:>5} PPI  {flag}")
+            print(f"\n  {ppi_checked} image(s) checked — "
+                  f"{len(ppi_issues)} issue(s), {ok_count} ok")
+        else:
+            # ── Compact summary (default) ─────────────────────────────────────
+            print(f"  {ppi_checked} image(s) checked — "
+                  f"{len(ppi_issues)} issue(s)  ({ok_count} ok)")
+            if oversized:
+                over_slides = sorted({i['slide'] for i in oversized})
+                worst = max(oversized, key=lambda i: i['oversize_x'] or 0)
+                print(f"  ⚠  {len(oversized):>3} oversized  (>{_PPI_HIGH} PPI)  "
+                      f"on slides {fmt_slide_list(over_slides, show_count=False)}")
+                print(f"       worst: {worst['oversize_x']}× — {worst['name']}  "
+                      f"slide {worst['slide']}  "
+                      f"({worst['img_w']}×{worst['img_h']} px → "
+                      f"~{worst['ideal_w']}×{worst['ideal_h']} px ideal)")
+            if blurry:
+                blur_slides = sorted({i['slide'] for i in blurry})
+                print(f"  ⚠  {len(blurry):>3} blurry     (<{_PPI_LOW} PPI)   "
+                      f"on slides {fmt_slide_list(blur_slides, show_count=False)}")
+            print(f"\n  Add --verbose for per-image detail")
 
     # ── Transitions & animations ───────────────────────────────────────────────
     transitions  = []
@@ -1017,9 +1054,10 @@ def analyze(path, display_wh=(1920, 1080)):
     # ── Embedded OLE objects ───────────────────────────────────────────────────
     ole_files = [f for f in zf.namelist() if '/embeddings/' in f]
     if ole_files:
+        ole_total = sum(zf.getinfo(f).file_size for f in ole_files)
         section_header(f"EMBEDDED OBJECTS / OLE  ({len(ole_files)})")
-        for f in ole_files:
-            print(f"  {Path(f).name}  ({fmt_size(zf.getinfo(f).file_size)})")
+        print(f"  {len(ole_files)} embedded object(s)   {fmt_size(ole_total)} total")
+        print(f"  ⚠  Requires matching software (Excel, etc.) to render on playback machine")
 
     # ── Charts ─────────────────────────────────────────────────────────────────
     chart_files = [f for f in zf.namelist() if f.startswith('ppt/charts/chart')]
@@ -1173,5 +1211,10 @@ if __name__ == '__main__':
         default=(1920, 1080),
         help='Target display resolution (default: 1920x1080)',
     )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Show full per-image resolution detail (default: summary only)',
+    )
     args = parser.parse_args()
-    analyze(args.file, display_wh=args.display)
+    analyze(args.file, display_wh=args.display, verbose=args.verbose)
