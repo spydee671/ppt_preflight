@@ -18,8 +18,12 @@ Requires:
 """
 
 import argparse
+import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 from collections import defaultdict, Counter
@@ -599,14 +603,81 @@ def _probe_mp4_codec(data: bytes):
     return None
 
 
+# ffprobe codec names → our labels
+_FFPROBE_CODEC_MAP = {
+    'h264':        'H.264',   'h265':  'H.265',  'hevc':   'H.265',
+    'prores':      'ProRes',  'av1':   'AV1',
+    'vp8':         'VP8',     'vp9':   'VP9',
+    'mpeg4':       'MPEG-4',  'mpeg2video': 'MPEG-2',
+    'wmv1':        'WMV',     'wmv2':  'WMV',    'wmv3':   'WMV',   'vc1': 'WMV',
+    'dvvideo':     'DV',      'mjpeg': 'Motion JPEG',
+    'theora':      'Theora',
+}
+
+_FFPROBE_SIZE_LIMIT = 500 * 1024 * 1024  # skip extraction for files > 500 MB
+_ffprobe_exe = None   # lazily resolved: False = not found, str = path
+
+
+def _get_ffprobe():
+    global _ffprobe_exe
+    if _ffprobe_exe is None:
+        _ffprobe_exe = shutil.which('ffprobe') or False
+    return _ffprobe_exe or None
+
+
+def _ffprobe_codec(rel, zf, ext: str):
+    """Extract video to a temp file and run ffprobe. Returns codec label or None."""
+    fp = _get_ffprobe()
+    if not fp:
+        return None
+    try:
+        zip_path = str(rel.target_part.partname).lstrip('/')
+        file_size = zf.getinfo(zip_path).file_size
+        if file_size > _FFPROBE_SIZE_LIMIT:
+            return None   # too large to extract
+        suffix = ext if ext.startswith('.') else f'.{ext}'
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        try:
+            with os.fdopen(fd, 'wb') as fout:
+                fout.write(zf.read(zip_path))
+            result = subprocess.run(
+                [fp, '-v', 'error',
+                 '-select_streams', 'v:0',
+                 '-show_entries', 'stream=codec_name',
+                 '-of', 'default=noprint_wrappers=1:nokey=1',
+                 tmp_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            codec_raw = result.stdout.strip().lower()
+            if codec_raw:
+                return _FFPROBE_CODEC_MAP.get(codec_raw, codec_raw.upper())
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return None
+
+
 def _video_codec(rel, zf, ext: str):
     """Detect codec for an embedded video. Returns a label string or None."""
     try:
         if ext in ('.mp4', '.mov', '.m4v'):
+            # Fast path: custom ISOBMFF parser on first 256 KB (handles fast-start files)
             zip_path = str(rel.target_part.partname).lstrip('/')
             with zf.open(zip_path) as f:
                 data = f.read(_CODEC_PROBE_BYTES)
-            return _probe_mp4_codec(data)
+            result = _probe_mp4_codec(data)
+            if result is not None:
+                return result
+            # moov not in first 256 KB (non-fast-start) — fall through to ffprobe
+        # ffprobe handles all formats and moov-at-end files
+        fp_result = _ffprobe_codec(rel, zf, ext)
+        if fp_result:
+            return fp_result
+        # Container-type fallback when ffprobe is unavailable
         if ext == '.wmv':
             return 'WMV'
         if ext == '.avi':
@@ -1004,6 +1075,10 @@ def analyze(path, display_wh=(1920, 1080), verbose=False):
         if has_unknown:
             print(f"  ⚠  '?' = playback settings unreadable (older embed format) — "
                   f"verify autoplay/loop/mute manually in PowerPoint")
+        unknown_codec = [v for v in all_videos if v['embedded'] and v.get('codec') is None]
+        if unknown_codec and not _get_ffprobe():
+            print(f"  ℹ  {len(unknown_codec)} codec(s) undetected — "
+                  f"install FFmpeg (ffprobe) for full codec detection")
 
     # ── AUDIO ──────────────────────────────────────────────────────────────────
     def print_audio_section(items):
